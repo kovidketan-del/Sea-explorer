@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+sea_explorer.log
+progress_state.json
+*.tmp
