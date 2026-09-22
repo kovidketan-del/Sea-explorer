@@ -598,3 +598,199 @@ class SeaExplorerBot:
             if kind=="oxygen":
                 self.progress.oxygen_purchases += 1
                 self.progress.oxygen_level_estimate += int(self.cfg["oxygen_step"])
+                log(f"oxygen upgrade confirmed -> estimated level {self.progress.oxygen_level_estimate}")
+            else:
+                self.progress.bag_purchases += 1
+                log(f"bag upgrade confirmed -> +{self.progress.bag_purchases} automated bag upgrades")
+            self.progress.save()
+            return True
+
+        log(f"{kind}: no clear HOME confirmation; not counting purchase.")
+        return False
+
+    def _handle_home(self, frame):
+        if self.home_handled:
+            return
+        self.home_handled=True
+        self.sweeper.stop()
+
+        goal=int(self.cfg["goal_oxygen_level"])
+        if self.progress.oxygen_level_estimate >= goal:
+            log(f"GOAL REACHED: estimated oxygen level {self.progress.oxygen_level_estimate} >= {goal}")
+            raise SystemExit(0)
+
+        cadence=self._bag_cadence()
+        due=(self.progress.runs_completed-self.progress.last_bag_attempt_run)>=cadence
+        if due and self.progress.runs_completed>0:
+            self.progress.last_bag_attempt_run=self.progress.runs_completed
+            self.progress.save()
+            # Bag is the income engine. In the recordings, 7 slots fill long
+            # before 170 oxygen is exhausted, so invest periodically.
+            self._attempt_upgrade(frame,"bag")
+            time.sleep(.35)
+            frame=self.adb.screenshot()
+
+        # Oxygen is the actual objective. Spend as much as currently affordable,
+        # but cap the batch so a single HOME visit cannot loop forever.
+        for _ in range(int(self.cfg["economy"]["max_oxygen_purchases_per_home"])):
+            if self.progress.oxygen_level_estimate >= goal:
+                log(f"GOAL REACHED: estimated oxygen level {self.progress.oxygen_level_estimate} >= {goal}")
+                raise SystemExit(0)
+            ok=self._attempt_upgrade(frame,"oxygen")
+            if not ok:
+                break
+            time.sleep(.25)
+            frame=self.adb.screenshot()
+
+        # Drop back in for another earning run.
+        log("Starting next dive.")
+        self._tap_norm(frame,self.cfg["taps"]["start_run"])
+        time.sleep(float(self.cfg["timing"]["after_start_tap_s"]))
+
+    def _recover_unknown(self, frame):
+        now=time.monotonic()
+        if self.unknown_since is None:
+            self.unknown_since=now
+            return
+        age=now-self.unknown_since
+        if age >= float(self.cfg["timing"]["unknown_back_after_s"]) and now-self.last_recovery>8:
+            self.last_recovery=now
+            self.sweeper.stop()
+            log(f"UNKNOWN persisted {age:.1f}s -> Android Back")
+            if not self.dry_run:
+                self.adb.back()
+        if age >= float(self.cfg["timing"]["unknown_relaunch_after_s"]) and now-self.last_recovery>8:
+            self.last_recovery=now
+            self.sweeper.stop()
+            package=self._resolve_package()
+            log(f"UNKNOWN persisted {age:.1f}s -> relaunch {package}")
+            if not self.dry_run:
+                self.adb.start_app(package)
+            self.unknown_since=now
+
+    def run(self):
+        package=self._resolve_package()
+        log(
+            f"START package={package} dry_run={self.dry_run} "
+            f"oxygen_est={self.progress.oxygen_level_estimate}/{self.cfg['goal_oxygen_level']} "
+            f"runs={self.progress.runs_completed}"
+        )
+        last_status=0.0
+        try:
+            while True:
+                frame=self.adb.screenshot()
+                det=self.vision.detect(frame)
+                now=time.monotonic()
+
+                if det.state!="UNKNOWN":
+                    self.unknown_since=None
+
+                if det.state != self.prev_state:
+                    log(f"STATE {self.prev_state or '-'} -> {det.state} conf={det.confidence:.2f}")
+                    if self.prev_state=="PLAYING" and det.state in {"RESULT","TRANSITION"}:
+                        self.progress.runs_completed += 1
+                        self.progress.save()
+                        log(f"Completed run #{self.progress.runs_completed}")
+                    if det.state!="HOME":
+                        self.home_handled=False
+                    self.prev_state=det.state
+
+                if det.state=="PLAYING":
+                    reason,target=self.sweeper.step(frame,det.hazards,self.dry_run)
+                    if now-last_status>=1.0:
+                        log(f"{reason} target={target} hazards={len(det.hazards)}")
+                        last_status=now
+                    time.sleep(float(self.cfg["timing"]["gameplay_loop_s"]))
+                    continue
+
+                self.sweeper.stop()
+
+                if det.state=="HOME":
+                    self._handle_home(frame)
+                elif det.state=="RESULT":
+                    if det.orange_button:
+                        log(f"Claiming run reward at {det.orange_button}")
+                        if not self.dry_run:
+                            self.adb.tap(*det.orange_button)
+                        time.sleep(float(self.cfg["timing"]["after_result_tap_s"]))
+                elif det.state=="WIN_MACHINE":
+                    log("Closing optional Win Machine; never pressing SPIN/ad.")
+                    self._popup_close(frame,det)
+                    time.sleep(.6)
+                elif det.state=="NOT_ENOUGH":
+                    self._popup_close(frame,det)
+                    time.sleep(.4)
+                elif det.state=="UNKNOWN":
+                    self._recover_unknown(frame)
+                else:
+                    # RESULT animations/loading should be allowed to settle.
+                    time.sleep(.35)
+
+                time.sleep(float(self.cfg["timing"]["non_gameplay_loop_s"]))
+        finally:
+            self.sweeper.stop()
+            self.progress.save()
+            log("STOP; touch released and progress saved.")
+
+
+def analyze_video(path, cfg, every_s=1.0):
+    cap=cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise BotError(f"Cannot open video: {path}")
+    fps=cap.get(cv2.CAP_PROP_FPS) or 30.0
+    frames=int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration=frames/fps
+    vision=Vision(cfg)
+    counts={}
+    hazard_frames=0
+    max_hazards=0
+    t=0.0
+    while t<=duration:
+        cap.set(cv2.CAP_PROP_POS_MSEC,t*1000)
+        ok,fr=cap.read()
+        if not ok:
+            break
+        d=vision.detect(fr)
+        counts[d.state]=counts.get(d.state,0)+1
+        if d.hazards:
+            hazard_frames+=1
+            max_hazards=max(max_hazards,len(d.hazards))
+        t+=every_s
+    cap.release()
+    print(json.dumps({
+        "video": str(path),
+        "duration_s": round(duration,2),
+        "sample_interval_s": every_s,
+        "states": counts,
+        "hazard_samples": hazard_frames,
+        "max_hazards_in_sample": max_hazards,
+    }, indent=2))
+
+
+def main():
+    p=argparse.ArgumentParser(description="Sea Explorer autonomous sweeper + purple-hazard avoidance + oxygen upgrade bot")
+    p.add_argument("--dry-run",action="store_true",help="detect/plan but do not tap or move")
+    p.add_argument("--analyze-video",metavar="MP4",help="offline diagnostic against a recording; no phone required")
+    p.add_argument("--sample-every",type=float,default=1.0,help="seconds between offline video samples")
+    args=p.parse_args()
+
+    cfg=load_config()
+    if args.analyze_video:
+        analyze_video(args.analyze_video,cfg,max(.2,args.sample_every))
+        return 0
+
+    try:
+        SeaExplorerBot(cfg,dry_run=args.dry_run).run()
+        return 0
+    except SystemExit as e:
+        return int(e.code or 0)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        return 130
+    except Exception as e:
+        log(f"ERROR {type(e).__name__}: {e}")
+        return 1
+
+
+if __name__=="__main__":
+    raise SystemExit(main())
