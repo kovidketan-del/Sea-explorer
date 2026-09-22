@@ -398,3 +398,203 @@ class Vision:
         if self._win_machine(hsv):
             # The close X is fixed at upper-right in supplied recordings.
             return Detection("WIN_MACHINE", .97, popup_close=(int(w*.965),int(h*.085)))
+
+        if self._gameplay_hud(hsv):
+            return Detection("PLAYING", .99, hazards=self.hazards(frame))
+
+        if self._home(hsv):
+            return Detection("HOME", .97)
+
+        orange=self._lower_orange_button(hsv)
+        if dark >= .22 and orange is not None:
+            return Detection("RESULT", .90, orange_button=orange)
+
+        # A darkened transitional/reward frame without its button fully visible yet.
+        if dark >= .30:
+            return Detection("TRANSITION", .65)
+
+        return Detection("UNKNOWN", .30)
+
+
+class Sweeper:
+    def __init__(self, adb: ADB, cfg: dict):
+        self.adb=adb
+        self.cfg=cfg
+        self.active=False
+        self.points=[]
+        self.index=0
+        self.last_target=None
+        self._make_points()
+
+    def _make_points(self):
+        m=self.cfg["motion"]
+        left=float(m["x_left"]); right=float(m["x_right"])
+        rows=[float(x) for x in m["rows"]]
+        pts=[]
+        for i,y in enumerate(rows):
+            if i%2==0:
+                pts += [(left,y),(right,y)]
+            else:
+                pts += [(right,y),(left,y)]
+        self.norm_points=pts
+
+    def stop(self):
+        if self.active and self.adb.supports_motionevent():
+            try:
+                if self.last_target:
+                    self.adb.motionevent("UP",*self.last_target,check=False)
+                else:
+                    self.adb.motionevent("UP",1,1,check=False)
+            except Exception:
+                pass
+        self.active=False
+
+    def _px(self, norm, w, h):
+        return (int(clamp(norm[0],.02,.98)*w),int(clamp(norm[1],.08,.92)*h))
+
+    def _danger(self, point, hazards, w):
+        danger=float(self.cfg["motion"]["danger_radius_ratio"])*w
+        return any(math.hypot(point[0]-hx,point[1]-hy) <= danger+hr for hx,hy,hr in hazards)
+
+    def _flee(self, hazards, w, h):
+        m=self.cfg["motion"]
+        bounds=[
+            self._px((m["x_left"], m["rows"][0]),w,h),
+            self._px((m["x_right"], m["rows"][0]),w,h),
+            self._px((m["x_left"], m["rows"][-1]),w,h),
+            self._px((m["x_right"], m["rows"][-1]),w,h),
+        ]
+        base=self.last_target or (w//2,h//2)
+        # Pick the safe corner maximizing distance from all detected hazards and
+        # mildly preferring a shorter trip from our last commanded position.
+        best=None
+        for p in bounds:
+            if not hazards:
+                score=0
+            else:
+                score=min(math.hypot(p[0]-hx,p[1]-hy)-hr for hx,hy,hr in hazards)
+            score -= .12*math.hypot(p[0]-base[0],p[1]-base[1])
+            if best is None or score>best[0]:
+                best=(score,p)
+        return best[1]
+
+    def step(self, frame, hazards, dry_run=False):
+        h,w=frame.shape[:2]
+        if hazards:
+            target=self._flee(hazards,w,h)
+            reason=f"EVADE {len(hazards)} purple hazard(s)"
+        else:
+            target=None
+            # Skip sweep points too close to a detected hazard. Normally the
+            # list is empty here, but this keeps the rule explicit.
+            for _ in range(len(self.norm_points)):
+                p=self._px(self.norm_points[self.index],w,h)
+                self.index=(self.index+1)%len(self.norm_points)
+                if not self._danger(p,hazards,w):
+                    target=p
+                    break
+            if target is None:
+                target=(w//2,int(h*.18))
+            reason="SWEEP"
+
+        if dry_run:
+            self.last_target=target
+            return reason,target
+
+        if self.adb.supports_motionevent():
+            if not self.active:
+                self.adb.motionevent("DOWN",*target)
+                self.active=True
+            else:
+                self.adb.motionevent("MOVE",*target)
+        else:
+            start=self.last_target or (w//2,h//2)
+            self.adb.swipe(start[0],start[1],target[0],target[1],ms=int(self.cfg["motion"]["fallback_swipe_ms"]))
+        self.last_target=target
+        return reason,target
+
+
+class SeaExplorerBot:
+    def __init__(self, cfg, dry_run=False):
+        self.cfg=cfg
+        self.dry_run=dry_run
+        self.adb=ADB(cfg.get("adb_path",""))
+        self.adb.ensure_ready()
+        self.adb.keep_awake_usb()
+        self.vision=Vision(cfg)
+        self.progress=Progress.load(int(cfg["starting_oxygen_level"]))
+        self.sweeper=Sweeper(self.adb,cfg)
+        self.prev_state=None
+        self.home_handled=False
+        self.unknown_since=None
+        self.last_recovery=0.0
+
+    def _tap_norm(self, frame, pair):
+        h,w=frame.shape[:2]
+        x=int(float(pair[0])*w); y=int(float(pair[1])*h)
+        if self.dry_run:
+            log(f"DRY TAP ({x},{y})")
+        else:
+            self.adb.tap(x,y)
+
+    def _resolve_package(self):
+        if self.progress.package:
+            return self.progress.package
+        configured=self.cfg.get("package","").strip()
+        if configured:
+            self.progress.package=configured
+            self.progress.save()
+            return configured
+        package=self.adb.foreground_package()
+        if not package or package.startswith(("com.android.","com.google.android.","com.brave.")):
+            raise BotError("Open Sea Explorer on the phone first, then run the bot once. It will remember the package automatically.")
+        self.progress.package=package
+        self.progress.save()
+        log(f"Detected game package: {package}")
+        return package
+
+    def _bag_cadence(self):
+        level=self.progress.oxygen_level_estimate
+        tiers=self.cfg["economy"]["bag_every_runs"]
+        for row in tiers:
+            if level < int(row["until_oxygen"]):
+                return int(row["every_runs"])
+        return int(tiers[-1]["every_runs"])
+
+    def _popup_close(self, frame, det):
+        if det.popup_close:
+            x,y=det.popup_close
+            if self.dry_run: log(f"DRY close popup ({x},{y})")
+            else: self.adb.tap(x,y)
+        else:
+            self._tap_norm(frame,self.cfg["taps"]["popup_close_fallback"])
+
+    def _attempt_upgrade(self, frame, kind):
+        tap=self.cfg["taps"][f"{kind}_upgrade"]
+        log(f"Attempting {kind} upgrade...")
+        self._tap_norm(frame,tap)
+        if self.dry_run:
+            return False
+
+        deadline=time.monotonic()+float(self.cfg["economy"]["upgrade_result_timeout_s"])
+        saw_home=False
+        while time.monotonic()<deadline:
+            time.sleep(.30)
+            after=self.adb.screenshot()
+            d=self.vision.detect(after)
+            if d.state=="NOT_ENOUGH":
+                log(f"{kind}: not enough coins.")
+                self._popup_close(after,d)
+                time.sleep(.35)
+                return False
+            if d.state=="HOME":
+                saw_home=True
+                # Successful upgrades leave us on HOME; give the price/level
+                # animation enough time to settle before counting it.
+                if time.monotonic() > deadline-.9:
+                    break
+
+        if saw_home:
+            if kind=="oxygen":
+                self.progress.oxygen_purchases += 1
+                self.progress.oxygen_level_estimate += int(self.cfg["oxygen_step"])
