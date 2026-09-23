@@ -37,18 +37,21 @@
     ]
   },
   "motion": {
-    "x_left": 0.05,
-    "x_right": 0.95,
+    "x_left": 0.02,
+    "x_right": 0.98,
     "danger_radius_ratio": 0.12,
     "danger_ahead_ratio": 0.4,
     "danger_behind_ratio": 0.12,
     "gesture_lookahead_ratio": 0.06,
-    "sweep_ms": 110,
-    "escape_ms": 120,
+    "sweep_ms": 20,
+    "escape_ms": 60,
     "clear_frames": 2,
     "control_y": 0.67,
     "scrcpy_window_title": "RMX3853",
-    "blocked_poll_s": 0.015
+    "blocked_poll_s": 0.008,
+    "swipe_command_gap_ms": 0,
+    "target_xv_left": -19,
+    "target_xv_right": 20
   },
   "economy": {
     "max_oxygen_purchases_per_home": 8,

@@ -18,7 +18,7 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parent
-BUILD = "adb-direct-continuous-2"
+BUILD = "adb-direct-maxspeed-3"
 CONFIG_PATH = ROOT / "config.json"
 STATE_PATH = ROOT / "progress_state.json"
 LOG_PATH = ROOT / "sea_explorer.log"
@@ -206,13 +206,82 @@ class ADB:
         self.run("shell","svc","power","stayon","usb",check=False)
 
 
-class ADBTouch:
-    """ScrcpyTouch-compatible adapter backed only by Android ADB input."""
+class ADBSwipeStream:
+    """One persistent hidden adb shell for high-rate swipe commands.
 
-    def __init__(self, adb: ADB):
+    Starting a fresh adb.exe for every swipe adds substantial Windows/ADB
+    round-trip latency. This stream keeps one shell open and feeds Android
+    touchscreen swipe commands to it continuously.
+    """
+
+    def __init__(self, adb: ADB, *, command_gap_ms: int = 0):
+        self.adb=adb
+        self.command_gap_ms=max(0,int(command_gap_ms))
+        self.proc=None
+        self._lock=threading.Lock()
+
+    def _ensure(self):
+        if self.proc is not None and self.proc.poll() is None:
+            return
+        self.proc=subprocess.Popen(
+            self.adb._cmd("shell"),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+            **_hidden_subprocess_kwargs(),
+        )
+
+    def swipe(self, x1, y1, x2, y2, duration_ms):
+        duration_ms=max(1,int(duration_ms))
+        with self._lock:
+            self._ensure()
+            if self.proc.stdin is None:
+                raise BotError("ADB swipe stream stdin is unavailable")
+            self.proc.stdin.write(
+                f"input touchscreen swipe {int(x1)} {int(y1)} "
+                f"{int(x2)} {int(y2)} {duration_ms}\n"
+            )
+            self.proc.stdin.flush()
+        # Pace only by the gesture duration so the device queue never gets
+        # flooded. No extra host ADB process is started between swipes.
+        time.sleep((duration_ms+self.command_gap_ms)/1000.0)
+
+    def interrupt(self):
+        """Immediately kill queued/current movement commands for hazard response."""
+        with self._lock:
+            proc=self.proc
+            self.proc=None
+            if proc is None:
+                return
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except OSError:
+                pass
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=.25)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=.25)
+            except OSError:
+                pass
+
+    close=interrupt
+
+
+class ADBTouch:
+    """Fast direct-ADB touch adapter using one persistent shell."""
+
+    def __init__(self, adb: ADB, *, command_gap_ms: int = 0):
         self.adb=adb
         self.position: tuple[int,int] | None=None
         self.active=False
+        self.stream=ADBSwipeStream(adb,command_gap_ms=command_gap_ms)
 
     def begin(self, x, y, w, h):
         self.position=(int(x),int(y))
@@ -225,11 +294,17 @@ class ADBTouch:
             self.active=True
             return
         start=self.position
-        self.adb.swipe(start[0],start[1],target[0],target[1],duration_ms)
+        self.stream.swipe(start[0],start[1],target[0],target[1],duration_ms)
         self.position=target
         self.active=True
 
+    def interrupt(self):
+        # Keep the last expected control position but cancel any queued device
+        # commands so purple-hazard parking can take effect immediately.
+        self.stream.interrupt()
+
     def release(self):
+        self.stream.close()
         self.position=None
         self.active=False
 
@@ -654,8 +729,8 @@ class Sweeper:
                 left=self._px((m["x_left"],self.control_y),w,h)[0]
                 right=self._px((m["x_right"],self.control_y),w,h)[0]
                 margin=float(m.get("danger_radius_ratio",.12))*w
-                sweep_ms=int(m.get("sweep_ms",110))
-                escape_ms=int(m.get("escape_ms",120))
+                sweep_ms=int(m.get("sweep_ms",20))
+                escape_ms=int(m.get("escape_ms",60))
                 start=start or (w//2,row_y)
 
                 if blocked:
@@ -739,10 +814,13 @@ class Sweeper:
         h,w=frame.shape[:2]
         threats=self._threats(hazards,h)
 
+        should_interrupt=False
         with self._lock:
             self._frame_size=(w,h)
             self._threat_cache=threats
             if threats:
+                if not self.blocked:
+                    should_interrupt=True
                 self.blocked=True
                 self.clear_frames=0
             elif self.blocked:
@@ -753,6 +831,11 @@ class Sweeper:
             status=self._status
             target=self.last_target
             worker_error=self._worker_error
+
+        if should_interrupt and not dry_run and self.touch is not None:
+            # Kill the persistent motion shell so no already-buffered crossing
+            # can continue after a fresh purple-hazard detection.
+            self.touch.interrupt()
 
         if worker_error is not None:
             raise BotError(f"Continuous ADB movement failed: {worker_error}") from worker_error
@@ -781,7 +864,13 @@ class SeaExplorerBot:
         self.vision=Vision(cfg)
         self.progress=Progress.load(int(cfg["starting_oxygen_level"]))
         # window_title is accepted only for backward CLI compatibility.
-        self.sweeper=Sweeper(None if dry_run else ADBTouch(self.adb),cfg)
+        self.sweeper=Sweeper(
+            None if dry_run else ADBTouch(
+                self.adb,
+                command_gap_ms=int(cfg["motion"].get("swipe_command_gap_ms",0)),
+            ),
+            cfg,
+        )
         self.prev_state=None
         self.playing_unknown_since=None
         self.home_handled=False
