@@ -17,7 +17,7 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parent
-BUILD = "one-go-livefix-2"
+BUILD = "one-go-livefix-3"
 CONFIG_PATH = ROOT / "config.json"
 STATE_PATH = ROOT / "progress_state.json"
 LOG_PATH = ROOT / "sea_explorer.log"
@@ -452,100 +452,150 @@ class Vision:
 
 
 class Sweeper:
+    """True fast swipe sweeper.
+
+    The old implementation kept one finger DOWN and teleported MOVE events
+    between far-away coordinates. This game visibly snaps the diver when fed
+    those jumps. The user plays it by making real rapid swipes, so this class
+    deliberately uses Android's interpolated `input swipe` gesture instead.
+
+    Consecutive swipes share the previous endpoint, producing a fast zig-zag
+    stroke across the arena instead of pointer teleportation.
+    """
+
     def __init__(self, adb: ADB, cfg: dict):
         self.adb=adb
         self.cfg=cfg
-        self.active=False
-        self.points=[]
-        self.index=0
+        m=cfg["motion"]
+        self.rows=[float(x) for x in m["rows"]]
+        self.row_index=0
+        self.row_direction=1
         self.last_target=None
-        self._make_points()
-
-    def _make_points(self):
-        m=self.cfg["motion"]
-        left=float(m["x_left"]); right=float(m["x_right"])
-        rows=[float(x) for x in m["rows"]]
-        pts=[]
-        for i,y in enumerate(rows):
-            if i%2==0:
-                pts += [(left,y),(right,y)]
-            else:
-                pts += [(right,y),(left,y)]
-        self.norm_points=pts
+        self.swipes_sent=0
 
     def stop(self):
-        if self.active and self.adb.supports_motionevent():
-            try:
-                if self.last_target:
-                    self.adb.motionevent("UP",*self.last_target,check=False)
-                else:
-                    self.adb.motionevent("UP",1,1,check=False)
-            except Exception:
-                pass
-        self.active=False
+        # Every Android input swipe releases by itself; there is no held
+        # motionevent finger to release. Reset the path for the next dive.
+        self.last_target=None
+        self.row_index=0
+        self.row_direction=1
 
     def _px(self, norm, w, h):
-        return (int(clamp(norm[0],.02,.98)*w),int(clamp(norm[1],.08,.92)*h))
+        return (
+            int(clamp(float(norm[0]),.02,.98)*w),
+            int(clamp(float(norm[1]),.08,.92)*h),
+        )
 
-    def _danger(self, point, hazards, w):
-        danger=float(self.cfg["motion"]["danger_radius_ratio"])*w
-        return any(math.hypot(point[0]-hx,point[1]-hy) <= danger+hr for hx,hy,hr in hazards)
+    @staticmethod
+    def _point_segment_distance(px,py,ax,ay,bx,by):
+        vx=bx-ax
+        vy=by-ay
+        denom=vx*vx+vy*vy
+        if denom <= 1e-9:
+            return math.hypot(px-ax,py-ay)
+        t=((px-ax)*vx+(py-ay)*vy)/denom
+        t=clamp(t,0.0,1.0)
+        cx=ax+t*vx
+        cy=ay+t*vy
+        return math.hypot(px-cx,py-cy)
 
-    def _flee(self, hazards, w, h):
+    def _segment_clearance(self, start, end, hazards, w):
+        if not hazards:
+            return float("inf")
+        margin=float(self.cfg["motion"]["danger_radius_ratio"])*w
+        ax,ay=start
+        bx,by=end
+        best=float("inf")
+        for hx,hy,hr in hazards:
+            d=self._point_segment_distance(hx,hy,ax,ay,bx,by)-(hr+margin)
+            best=min(best,d)
+        return best
+
+    def _advance_row(self):
+        if len(self.rows) <= 1:
+            return 0
+        nxt=self.row_index+self.row_direction
+        if nxt >= len(self.rows) or nxt < 0:
+            self.row_direction *= -1
+            nxt=self.row_index+self.row_direction
+        self.row_index=nxt
+        return nxt
+
+    def _normal_endpoint(self, start, w, h):
         m=self.cfg["motion"]
-        bounds=[
-            self._px((m["x_left"], m["rows"][0]),w,h),
-            self._px((m["x_right"], m["rows"][0]),w,h),
-            self._px((m["x_left"], m["rows"][-1]),w,h),
-            self._px((m["x_right"], m["rows"][-1]),w,h),
-        ]
-        base=self.last_target or (w//2,h//2)
-        # Pick the safe corner maximizing distance from all detected hazards and
-        # mildly preferring a shorter trip from our last commanded position.
+        next_row=self._advance_row()
+        go_right=start[0] <= w/2
+        x=float(m["x_right"] if go_right else m["x_left"])
+        return self._px((x,self.rows[next_row]),w,h)
+
+    def _safe_endpoint(self, start, hazards, w, h):
+        """Choose an opposite-edge endpoint whose whole swipe misses hazards."""
+        m=self.cfg["motion"]
+        go_right=start[0] <= w/2
+        x=float(m["x_right"] if go_right else m["x_left"])
+
         best=None
-        for p in bounds:
-            if not hazards:
-                score=0
-            else:
-                score=min(math.hypot(p[0]-hx,p[1]-hy)-hr for hx,hy,hr in hazards)
-            score -= .12*math.hypot(p[0]-base[0],p[1]-base[1])
+        for idx,row in enumerate(self.rows):
+            end=self._px((x,row),w,h)
+            clearance=self._segment_clearance(start,end,hazards,w)
+            # Prefer clearance first; slightly discourage giant vertical jumps
+            # when two candidate rows are similarly safe.
+            score=clearance-0.04*abs(end[1]-start[1])
             if best is None or score>best[0]:
-                best=(score,p)
-        return best[1]
+                best=(score,idx,end,clearance)
+
+        _,idx,end,clearance=best
+        self.row_index=idx
+        # Continue the row walk away from whichever boundary we selected.
+        if idx == 0:
+            self.row_direction=1
+        elif idx == len(self.rows)-1:
+            self.row_direction=-1
+        return end,clearance
 
     def step(self, frame, hazards, dry_run=False):
         h,w=frame.shape[:2]
-        if hazards:
-            target=self._flee(hazards,w,h)
-            reason=f"EVADE {len(hazards)} purple hazard(s)"
-        else:
-            target=None
-            # Skip sweep points too close to a detected hazard. Normally the
-            # list is empty here, but this keeps the rule explicit.
-            for _ in range(len(self.norm_points)):
-                p=self._px(self.norm_points[self.index],w,h)
-                self.index=(self.index+1)%len(self.norm_points)
-                if not self._danger(p,hazards,w):
-                    target=p
-                    break
-            if target is None:
-                target=(w//2,int(h*.18))
-            reason="SWEEP"
+        m=self.cfg["motion"]
+        swipe_ms=int(m.get("sweep_swipe_ms",55))
+        swipe_ms=max(25,min(180,swipe_ms))
 
-        if dry_run:
-            self.last_target=target
-            return reason,target
+        # Between hazard scans, fire several genuine rapid swipes exactly like
+        # fast finger play. When a purple hazard is visible, do only one
+        # clearance-maximizing swipe, then immediately let the outer loop take
+        # a fresh screenshot before moving again.
+        count=1 if hazards else int(m.get("sweeps_per_vision_frame",4))
+        count=max(1,min(8,count))
+        target=None
+        min_clearance=None
 
-        if self.adb.supports_motionevent():
-            if not self.active:
-                self.adb.motionevent("DOWN",*target)
-                self.active=True
+        for _ in range(count):
+            if self.last_target is None:
+                start=self._px((m["x_left"],self.rows[self.row_index]),w,h)
             else:
-                self.adb.motionevent("MOVE",*target)
+                start=self.last_target
+
+            if hazards:
+                target,clearance=self._safe_endpoint(start,hazards,w,h)
+                min_clearance=clearance if min_clearance is None else min(min_clearance,clearance)
+            else:
+                target=self._normal_endpoint(start,w,h)
+
+            if not dry_run:
+                # IMPORTANT: this is a real interpolated swipe gesture, not a
+                # DOWN + instant MOVE coordinate jump.
+                self.adb.swipe(start[0],start[1],target[0],target[1],ms=swipe_ms)
+
+            self.last_target=target
+            self.swipes_sent+=1
+
+        if hazards:
+            reason=(
+                f"EVADE-SWIPE {len(hazards)} purple hazard(s) "
+                f"clearance={min_clearance:.0f}px"
+            )
         else:
-            start=self.last_target or (w//2,h//2)
-            self.adb.swipe(start[0],start[1],target[0],target[1],ms=int(self.cfg["motion"]["fallback_swipe_ms"]))
-        self.last_target=target
+            reason=f"RAPID-SWIPE x{count} {swipe_ms}ms"
+
         return reason,target
 
 

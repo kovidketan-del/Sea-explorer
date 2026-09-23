@@ -45,7 +45,8 @@
       0.86
     ],
     "danger_radius_ratio": 0.24,
-    "fallback_swipe_ms": 85
+    "sweep_swipe_ms": 55,
+    "sweeps_per_vision_frame": 4
   },
   "economy": {
     "max_oxygen_purchases_per_home": 8,
@@ -71,7 +72,7 @@
     "upgrade_signature_change_min": 0.0035
   },
   "timing": {
-    "gameplay_loop_s": 0.08,
+    "gameplay_loop_s": 0.01,
     "non_gameplay_loop_s": 0.15,
     "after_start_tap_s": 0.8,
     "after_result_tap_s": 0.8,
