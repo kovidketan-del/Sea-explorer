@@ -17,7 +17,7 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parent
-BUILD = "one-go-livefix-3"
+BUILD = "one-go-livefix-4"
 CONFIG_PATH = ROOT / "config.json"
 STATE_PATH = ROOT / "progress_state.json"
 LOG_PATH = ROOT / "sea_explorer.log"
@@ -146,7 +146,23 @@ class ADB:
         return self.run("shell", "input", "motionevent", action.upper(), int(x), int(y), check=check)
 
     def swipe(self, x1, y1, x2, y2, ms=90):
-        self.run("shell", "input", "swipe", int(x1), int(y1), int(x2), int(y2), int(ms))
+        self.run("shell", "input", "touchscreen", "swipe", int(x1), int(y1), int(x2), int(y2), int(ms))
+
+    def swipe_burst(self, x1, y1, x2, y2, ms=32, repeats=6):
+        """Send several same-direction swipes in ONE adb shell session.
+
+        A separate adb process per swipe adds a visible pause. Bundling the
+        commands removes the PC<->phone round-trip between strokes while still
+        using Android's real interpolated swipe gesture.
+        """
+        repeats=max(1,min(12,int(repeats)))
+        ms=max(20,min(180,int(ms)))
+        one=(
+            f"input touchscreen swipe {int(x1)} {int(y1)} "
+            f"{int(x2)} {int(y2)} {ms}"
+        )
+        command="; ".join([one]*repeats)
+        self.run("shell","sh","-c",command,timeout=max(5,2+repeats*ms/1000.0))
 
     def supports_motionevent(self):
         if self._motionevent is not None:
@@ -339,6 +355,28 @@ class Vision:
         # The slot-machine popup is an enormous purple object occupying the center.
         return frac >= 0.10
 
+    def _win_machine_close(self, hsv):
+        """Detect the green X at the top-right of the Win Machine overlay."""
+        h,w=hsv.shape[:2]
+        mask=self._color_mask(hsv,35,95,90,75)
+        keep=np.zeros_like(mask)
+        keep[int(.09*h):int(.24*h),int(.82*w):int(.995*w)]=1
+        mask=(mask & keep).astype(np.uint8)
+        comps=self._components(mask,max(30,int(h*w*.00004)))
+        best=None
+        for x,y,bw,bh,a,cx,cy in comps:
+            wr,hr=bw/w,bh/h
+            xr,yr=cx/w,cy/h
+            fill=a/max(1,bw*bh)
+            if not (.055<=wr<=.17 and .025<=hr<=.11 and .86<=xr<=.98 and .11<=yr<=.22 and fill>=.28):
+                continue
+            score=fill-abs(xr-.93)-abs(yr-.17)
+            if best is None or score>best[0]:
+                best=(score,int(cx),int(cy))
+        if best is not None:
+            return (best[1],best[2])
+        return None
+
     def _lower_orange_button(self, hsv):
         h,w=hsv.shape[:2]
         best=None
@@ -431,8 +469,10 @@ class Vision:
             return Detection("NOT_ENOUGH", .98, popup_close=popup_close)
 
         if self._win_machine(hsv):
-            # The close X is fixed at upper-right in supplied recordings.
-            return Detection("WIN_MACHINE", .97, popup_close=(int(w*.965),int(h*.085)))
+            close=self._win_machine_close(hsv)
+            if close is None:
+                close=(int(w*.93),int(h*.17))
+            return Detection("WIN_MACHINE", .98, popup_close=close)
 
         if self._gameplay_hud(hsv):
             return Detection("PLAYING", .99, hazards=self.hazards(frame))
@@ -452,33 +492,32 @@ class Vision:
 
 
 class Sweeper:
-    """True fast swipe sweeper.
+    """High-rate left/right steering that matches the manual strategy.
 
-    The old implementation kept one finger DOWN and teleported MOVE events
-    between far-away coordinates. This game visibly snaps the diver when fed
-    those jumps. The user plays it by making real rapid swipes, so this class
-    deliberately uses Android's interpolated `input swipe` gesture instead.
+    Key detail: the diver cannot physically cross the screen in 30-50 ms.
+    Reversing every tiny swipe makes it dither around the wrong phase. We
+    therefore send a BURST of several very fast swipes in the SAME direction,
+    then reverse the next burst. The finger gesture is extremely fast, while
+    the repeated directional impulses give the diver time to reach each side.
 
-    Consecutive swipes share the previous endpoint, producing a fast zig-zag
-    stroke across the arena instead of pointer teleportation.
+    Normal play stays on one horizontal lane; vertical motion comes from the
+    game's scrolling. Only a detected purple hazard is allowed to move the
+    control lane temporarily up/down.
     """
 
     def __init__(self, adb: ADB, cfg: dict):
         self.adb=adb
         self.cfg=cfg
-        m=cfg["motion"]
-        self.rows=[float(x) for x in m["rows"]]
-        self.row_index=0
-        self.row_direction=1
+        self.go_right=True
         self.last_target=None
+        self.control_y=float(cfg["motion"].get("control_y",0.66))
+        self.current_lane=self.control_y
         self.swipes_sent=0
 
     def stop(self):
-        # Every Android input swipe releases by itself; there is no held
-        # motionevent finger to release. Reset the path for the next dive.
         self.last_target=None
-        self.row_index=0
-        self.row_direction=1
+        self.go_right=True
+        self.current_lane=self.control_y
 
     def _px(self, norm, w, h):
         return (
@@ -486,117 +525,73 @@ class Sweeper:
             int(clamp(float(norm[1]),.08,.92)*h),
         )
 
-    @staticmethod
-    def _point_segment_distance(px,py,ax,ay,bx,by):
-        vx=bx-ax
-        vy=by-ay
-        denom=vx*vx+vy*vy
-        if denom <= 1e-9:
-            return math.hypot(px-ax,py-ay)
-        t=((px-ax)*vx+(py-ay)*vy)/denom
-        t=clamp(t,0.0,1.0)
-        cx=ax+t*vx
-        cy=ay+t*vy
-        return math.hypot(px-cx,py-cy)
-
-    def _segment_clearance(self, start, end, hazards, w):
+    def _choose_safe_lane(self, hazards, h):
+        """Pick a horizontal lane farthest from the purple hazard centers."""
+        lanes=[float(v) for v in self.cfg["motion"].get(
+            "hazard_lanes",[0.48,0.58,0.66,0.74,0.82]
+        )]
         if not hazards:
-            return float("inf")
-        margin=float(self.cfg["motion"]["danger_radius_ratio"])*w
-        ax,ay=start
-        bx,by=end
-        best=float("inf")
-        for hx,hy,hr in hazards:
-            d=self._point_segment_distance(hx,hy,ax,ay,bx,by)-(hr+margin)
-            best=min(best,d)
-        return best
-
-    def _advance_row(self):
-        if len(self.rows) <= 1:
-            return 0
-        nxt=self.row_index+self.row_direction
-        if nxt >= len(self.rows) or nxt < 0:
-            self.row_direction *= -1
-            nxt=self.row_index+self.row_direction
-        self.row_index=nxt
-        return nxt
-
-    def _normal_endpoint(self, start, w, h):
-        m=self.cfg["motion"]
-        next_row=self._advance_row()
-        go_right=start[0] <= w/2
-        x=float(m["x_right"] if go_right else m["x_left"])
-        return self._px((x,self.rows[next_row]),w,h)
-
-    def _safe_endpoint(self, start, hazards, w, h):
-        """Choose an opposite-edge endpoint whose whole swipe misses hazards."""
-        m=self.cfg["motion"]
-        go_right=start[0] <= w/2
-        x=float(m["x_right"] if go_right else m["x_left"])
+            return self.control_y
 
         best=None
-        for idx,row in enumerate(self.rows):
-            end=self._px((x,row),w,h)
-            clearance=self._segment_clearance(start,end,hazards,w)
-            # Prefer clearance first; slightly discourage giant vertical jumps
-            # when two candidate rows are similarly safe.
-            score=clearance-0.04*abs(end[1]-start[1])
+        for lane in lanes:
+            y=lane*h
+            # Purple enemy avoidance is mainly vertical here because the next
+            # burst traverses almost the entire screen horizontally.
+            clearance=min(abs(y-hy)-hr for _,hy,hr in hazards)
+            # Prefer staying close to the normal lane when equally safe.
+            score=clearance-0.10*abs(lane-self.control_y)*h
             if best is None or score>best[0]:
-                best=(score,idx,end,clearance)
-
-        _,idx,end,clearance=best
-        self.row_index=idx
-        # Continue the row walk away from whichever boundary we selected.
-        if idx == 0:
-            self.row_direction=1
-        elif idx == len(self.rows)-1:
-            self.row_direction=-1
-        return end,clearance
+                best=(score,lane)
+        return best[1]
 
     def step(self, frame, hazards, dry_run=False):
         h,w=frame.shape[:2]
         m=self.cfg["motion"]
-        swipe_ms=int(m.get("sweep_swipe_ms",55))
-        swipe_ms=max(25,min(180,swipe_ms))
+        left=float(m["x_left"])
+        right=float(m["x_right"])
 
-        # Between hazard scans, fire several genuine rapid swipes exactly like
-        # fast finger play. When a purple hazard is visible, do only one
-        # clearance-maximizing swipe, then immediately let the outer loop take
-        # a fresh screenshot before moving again.
-        count=1 if hazards else int(m.get("sweeps_per_vision_frame",4))
-        count=max(1,min(8,count))
-        target=None
-        min_clearance=None
+        # Fast gesture, but enough same-direction repetitions for the diver to
+        # actually traverse before we reverse direction.
+        swipe_ms=max(20,min(90,int(m.get("sweep_swipe_ms",28))))
+        repeats=max(1,min(12,int(
+            m.get("hazard_repeats",2) if hazards
+            else m.get("same_direction_repeats",8)
+        )))
 
-        for _ in range(count):
-            if self.last_target is None:
-                start=self._px((m["x_left"],self.rows[self.row_index]),w,h)
-            else:
-                start=self.last_target
+        self.current_lane=self._choose_safe_lane(hazards,h)
+        y=int(self.current_lane*h)
+        if self.go_right:
+            start=self._px((left,self.current_lane),w,h)
+            end=self._px((right,self.current_lane),w,h)
+            direction="RIGHT"
+        else:
+            start=self._px((right,self.current_lane),w,h)
+            end=self._px((left,self.current_lane),w,h)
+            direction="LEFT"
 
-            if hazards:
-                target,clearance=self._safe_endpoint(start,hazards,w,h)
-                min_clearance=clearance if min_clearance is None else min(min_clearance,clearance)
-            else:
-                target=self._normal_endpoint(start,w,h)
+        if not dry_run:
+            self.adb.swipe_burst(
+                start[0],y,end[0],y,
+                ms=swipe_ms,
+                repeats=repeats,
+            )
 
-            if not dry_run:
-                # IMPORTANT: this is a real interpolated swipe gesture, not a
-                # DOWN + instant MOVE coordinate jump.
-                self.adb.swipe(start[0],start[1],target[0],target[1],ms=swipe_ms)
-
-            self.last_target=target
-            self.swipes_sent+=1
+        self.last_target=end
+        self.swipes_sent+=repeats
+        self.go_right=not self.go_right
 
         if hazards:
             reason=(
-                f"EVADE-SWIPE {len(hazards)} purple hazard(s) "
-                f"clearance={min_clearance:.0f}px"
+                f"EVADE-{direction} x{repeats} {swipe_ms}ms "
+                f"lane={self.current_lane:.2f} hazards={len(hazards)}"
             )
         else:
-            reason=f"RAPID-SWIPE x{count} {swipe_ms}ms"
-
-        return reason,target
+            reason=(
+                f"TURBO-{direction} x{repeats} {swipe_ms}ms "
+                f"lane={self.current_lane:.2f}"
+            )
+        return reason,end
 
 
 class SeaExplorerBot:
