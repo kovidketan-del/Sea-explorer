@@ -71,7 +71,12 @@ def main():
         result["direction_changes"]=bot.sweeper.direction_changes
         result["release_failed"]=bot.sweeper.release_failed
         result["last_state"]=bot.prev_state
-        result["success"]=result["status"]=="duration_reached" and not bot.sweeper.release_failed
+        result["gameplay_decisions"]=bot.sweeper.avoidance_decisions+bot.sweeper.collection_decisions
+        result["success"]=(result["status"]=="duration_reached"
+                           and not bot.sweeper.release_failed
+                           and result["gameplay_decisions"]>0)
+        if result["status"]=="duration_reached" and not result["gameplay_decisions"]:
+            result["status"]="no_gameplay_observed"
         return 0 if result["success"] else 1
     except Exception as exc:
         result["status"]="failed"
