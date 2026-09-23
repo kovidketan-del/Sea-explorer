@@ -1,6 +1,7 @@
 """Offline safety checks for the window-free scrcpy transport."""
 
 import struct
+import io
 import time
 import unittest
 
@@ -71,6 +72,24 @@ class LatestFrameTests(unittest.TestCase):
         runtime._last_delivered=0
         runtime._error=OSError("socket gone")
         with self.assertRaisesRegex(StreamUnavailable,"socket gone"):
+            runtime.capture(timeout=0)
+
+    def test_native_decoder_crash_is_contained_and_reported(self):
+        runtime=HeadlessScrcpy.__new__(HeadlessScrcpy)
+        import threading
+        runtime._condition=threading.Condition()
+        runtime._latest=None
+        runtime._sequence=0
+        runtime._last_delivered=0
+        runtime._error=None
+        runtime._closed=False
+        runtime._decoder_log=io.BytesIO(b"Windows fatal exception: access violation")
+        runtime.decoder_process=type("Crashed",(),{
+            "stdout":io.BytesIO(b""),
+            "poll":lambda self: 3221225477,
+        })()
+        runtime._frame_loop()
+        with self.assertRaisesRegex(StreamUnavailable,"access violation"):
             runtime.capture(timeout=0)
 
 

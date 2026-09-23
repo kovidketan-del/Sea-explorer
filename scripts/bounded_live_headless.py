@@ -1,6 +1,7 @@
 """One bounded, no-purchase device run with a saved receipt and safe cleanup."""
 
 import argparse
+import faulthandler
 import json
 import os
 import sys
@@ -15,6 +16,7 @@ from sea_explorer_bot import ADB,SeaExplorerBot,StopRequested,load_config
 
 
 def main():
+    faulthandler.enable(all_threads=True)
     parser=argparse.ArgumentParser()
     parser.add_argument("--seconds",type=float,default=75)
     parser.add_argument("--out",type=Path,required=True)
@@ -32,6 +34,7 @@ def main():
     adb.start_app("com.RayGaming.SeaExplorer")
     stop=threading.Event()
     bot=SeaExplorerBot(cfg,stop_event=stop,serial=adb.serial)
+    runs_before=bot.progress.runs_completed
     result={"serial":adb.serial,"seconds_requested":args.seconds,
             "backend":"scrcpy_stream","buy_upgrades":False}
     start=time.monotonic()
@@ -66,6 +69,7 @@ def main():
             result["status"]="duration_reached"
         result["elapsed_s"]=round(time.monotonic()-start,2)
         result["runs_completed_total"]=bot.progress.runs_completed
+        result["runs_completed_during_test"]=bot.progress.runs_completed-runs_before
         result["avoidance_decisions"]=bot.sweeper.avoidance_decisions
         result["collection_decisions"]=bot.sweeper.collection_decisions
         result["direction_changes"]=bot.sweeper.direction_changes
@@ -86,6 +90,12 @@ def main():
         timer.cancel()
         watchdog.cancel()
         result.setdefault("elapsed_s",round(time.monotonic()-start,2))
+        result.setdefault("runs_completed_during_test",bot.progress.runs_completed-runs_before)
+        result.setdefault("avoidance_decisions",bot.sweeper.avoidance_decisions)
+        result.setdefault("collection_decisions",bot.sweeper.collection_decisions)
+        result.setdefault("direction_changes",bot.sweeper.direction_changes)
+        result.setdefault("release_failed",bot.sweeper.release_failed)
+        result["stream"]=bot.stream_stats
         args.out.parent.mkdir(parents=True,exist_ok=True)
         args.out.write_text(json.dumps(result,indent=2),encoding="utf-8")
         try:

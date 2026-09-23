@@ -1003,6 +1003,7 @@ class SeaExplorerBot:
             touch=None if dry_run else ADBTouch(self.adb)
         self.sweeper=TargetController(touch,cfg)
         self.capture_runtime=None
+        self.stream_stats=None
         self.prev_state=None
         self.playing_unknown_since=None
         self.home_handled=False
@@ -1392,6 +1393,11 @@ class SeaExplorerBot:
                 self.sweeper.stop()
             finally:
                 if self.capture_runtime is not None:
+                    stream_metrics=getattr(self.capture_runtime,"metrics",None)
+                    if stream_metrics is not None:
+                        self.stream_stats={"frames":stream_metrics["frames"],
+                                           "packets":stream_metrics["packets"],
+                                           "last_frame_age_s":round(self.capture_runtime.last_frame_age,3)}
                     self.capture_runtime.close()
                     self.capture_runtime=None
                 self.progress.save()

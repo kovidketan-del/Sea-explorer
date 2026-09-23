@@ -117,10 +117,10 @@ Ctrl+C safely releases the held virtual touch and writes progress.
 HEADLESS CAPTURE AND CONTROL
 ----------------------------
 Normal pipeline: Android MediaCodec -> scrcpy 4.1 server -> ADB-forwarded H.264
-packets -> PyAV decode -> OpenCV BGR frame -> hazard/item vision -> target planner
+packets -> isolated PyAV decoder process -> OpenCV BGR frame -> hazard/item vision -> target planner
 -> scrcpy control socket. Only the newest decoded frame is retained. Gameplay
 touches are held across movements, with small interpolated moves and a release
-on stop or stale stream. Menus still use occasional ADB taps.
+on stop, stale stream, or decoder failure. Menus still use occasional ADB taps.
 
 Normal config is capture_backend/control_backend = scrcpy_stream. For optional
 troubleshooting with a visible preview, use scrcpy_window for both settings;

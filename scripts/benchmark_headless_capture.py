@@ -46,7 +46,8 @@ def main():
         w,h=runtime.video_size
         result["frame_size"]=[w,h]
         frame=runtime.capture()
-        start_cpu=own.cpu_times()
+        decoder=psutil.Process(runtime.decoder_process.pid)
+        start_cpu={"parent":own.cpu_times(),"decoder":decoder.cpu_times()}
         start=time.perf_counter()
         done=threading.Event()
         def animate():
@@ -70,10 +71,13 @@ def main():
                 changed+=1;last_sequence=runtime._sequence
         worker.join(timeout=2)
         elapsed=time.perf_counter()-start
-        end_cpu=own.cpu_times()
+        end_cpu={"parent":own.cpu_times(),"decoder":decoder.cpu_times()}
         result["stream_fps"] = round(changed/elapsed,1)
         result["new_frame_wait"] = summary(waits)
-        result["own_process_cpu_pct_one_core"] = round(100*((end_cpu.user+end_cpu.system)-(start_cpu.user+start_cpu.system))/elapsed,1)
+        cpu={name:round(100*((end_cpu[name].user+end_cpu[name].system)
+                             -(start_cpu[name].user+start_cpu[name].system))/elapsed,1)
+             for name in start_cpu}
+        result["cpu_pct_one_core"]=cpu|{"total":round(sum(cpu.values()),1)}
         result["decode"] = summary([x/1000 for x in runtime.metrics["decode_ms"]])
         result["bgr_conversion"] = summary([x/1000 for x in runtime.metrics["convert_ms"]])
         result["packets"] = runtime.metrics["packets"]

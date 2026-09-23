@@ -68,6 +68,21 @@ and headless CPU samples above were not under identical animation conditions,
 so they also do not prove an overall CPU reduction. These are explicit gaps,
 not values to fill with estimates.
 
+**Crash-safety update:** a gameplay run and a launcher-only held-touch test
+exposed a native PyAV/FFmpeg access violation inside `decoder.decode()`.
+The original in-process benchmark above predates the fix. Decoding now runs in
+a child process, passing BGR frames over a pipe; if native decoding faults,
+the bot sees EOF, releases held touch, and stops rather than crashing its own
+process. In a repeat launcher/Pointer Location benchmark of the isolated H.264
+path, 55.1 changing frames/s were delivered; new-frame wait median/p95 was
+15.6/52.2 ms; decoder and BGR conversion medians were 1.1/3.2 ms. The parent
+and decoder together consumed about 40% of one CPU core during pointer
+animation. These short samples do **not** establish that the final path has
+lower end-to-end latency than the visible-window baseline: the new p95 wait is
+higher than the earlier in-process sample, and a touch-to-overlay response
+varied from 80 to 245 ms. Stability and the lack of a visible window are the
+verified benefits of the isolation so far.
+
 For repeatable checks, run the benchmark scripts while the same phone and USB
 connection are available. The bounded no-purchase live check is
 `scripts/bounded_live_headless.py --seconds 75 --out <receipt.json>`; it releases

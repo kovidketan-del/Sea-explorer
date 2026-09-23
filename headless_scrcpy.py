@@ -15,6 +15,7 @@ import re
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -28,8 +29,6 @@ from scrcpy_binary import find_scrcpy
 SERVER_VERSION = "4.1"
 REMOTE_SERVER = "/data/local/tmp/sea-explorer-scrcpy-v4.1.jar"
 PACKET_CONFIG = 1 << 62
-PACKET_KEY = 1 << 61
-PACKET_PTS_MASK = PACKET_KEY - 1
 MAX_PACKET = 8 * 1024 * 1024
 
 
@@ -49,6 +48,18 @@ def _recv_exact(sock, count):
     return parts
 
 
+def _read_exact(stream, count):
+    parts=bytearray(count)
+    view=memoryview(parts)
+    offset=0
+    while offset<count:
+        n=stream.readinto(view[offset:])
+        if not n:
+            raise StreamUnavailable("decoder output ended before a complete frame")
+        offset+=n
+    return parts
+
+
 class HeadlessScrcpy:
     def __init__(self, adb, configured_path="", *, max_size=720, codec="h264", max_fps=0):
         if codec not in {"h264", "h265"}:
@@ -65,11 +76,14 @@ class HeadlessScrcpy:
         self.port = None
         self.process = None
         self._server_log = None
+        self._decoder_log = None
+        self.decoder_process = None
         self.video_socket = None
         self.control_socket = None
         self.video_size = None
         self.device_size = None
         self._thread = None
+        self._frame_thread = None
         self._condition = threading.Condition()
         self._latest = None
         self._sequence = 0
@@ -136,13 +150,24 @@ class HeadlessScrcpy:
                 raise StreamUnavailable("Missing scrcpy video session header")
             self.video_size=struct.unpack(">II",session[4:12])
             self.video_socket.settimeout(None)
-            self._thread=threading.Thread(target=self._decode_loop,name="SeaExplorer-H264-Decoder",daemon=True)
+            self._decoder_log=tempfile.TemporaryFile(mode="w+b")
+            worker=Path(__file__).resolve().parent / "scripts" / "scrcpy_decoder_worker.py"
+            self.decoder_process=subprocess.Popen(
+                [sys.executable,"-X","faulthandler","-u",str(worker),"--codec",self.codec],
+                stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=self._decoder_log,
+                **_hidden_process_options(),
+            )
+            self._thread=threading.Thread(target=self._packet_loop,name="SeaExplorer-Video-Packets",daemon=True)
+            self._frame_thread=threading.Thread(target=self._frame_loop,name="SeaExplorer-Decoded-Frames",daemon=True)
+            self._frame_thread.start()
             self._thread.start()
             # The first decoded frame establishes that the codec and transport
             # actually work; a successful socket connection alone is not enough.
             self.capture(timeout=6)
         except Exception as exc:
             details=self._server_diagnostics()
+            if self.decoder_process is not None:
+                details+=f"; decoder: {self._decoder_diagnostics()}"
             self.close()
             raise StreamUnavailable(f"{exc}; scrcpy server: {details}") from exc
 
@@ -156,60 +181,70 @@ class HeadlessScrcpy:
         except OSError:
             return "server log unavailable"
 
-    def _decode_loop(self):
+    def _packet_loop(self):
         try:
-            import av
-            decoder=av.CodecContext.create("hevc" if self.codec=="h265" else "h264","r")
-            decoder.thread_count=1  # frame threading would add queue latency
             while not self._closed:
                 header=_recv_exact(self.video_socket,12)
                 if header[0]&0x80:
-                    self.video_size=struct.unpack(">II",header[4:12])
-                    decoder=av.CodecContext.create("hevc" if self.codec=="h265" else "h264","r")
-                    decoder.thread_count=1
-                    continue
+                    raise StreamUnavailable("scrcpy video session changed; stopping held touch safely")
                 pts_flags,length=struct.unpack(">QI",header)
                 if not 0<length<=MAX_PACKET:
                     raise StreamUnavailable(f"Invalid scrcpy packet length: {length}")
                 payload=_recv_exact(self.video_socket,length)
-                arrived=time.perf_counter()
-                if pts_flags&PACKET_CONFIG:
-                    # MediaCodec sends SPS/PPS as a standalone configuration
-                    # packet. Feed it as decoder extradata, not a video frame.
-                    decoder.extradata=bytes(payload)
-                    self.metrics["packets"]+=1
-                    continue
-                packet=av.Packet(payload)
-                packet.pts=pts_flags&PACKET_PTS_MASK
-                packet.dts=packet.pts
-                try:
-                    frames=decoder.decode(packet)
-                except Exception as exc:
-                    raise StreamUnavailable(
-                        f"decode failed flags=0x{pts_flags:x} length={length} "
-                        f"prefix={bytes(payload[:24]).hex()}: {exc}"
-                    ) from exc
-                decoded=time.perf_counter()
+                pipe=self.decoder_process.stdin
+                if pipe is None:
+                    raise StreamUnavailable("decoder stdin unavailable")
+                pipe.write(header)
+                pipe.write(payload)
+                pipe.flush()
                 self.metrics["packets"]+=1
-                if not frames:
-                    continue
-                for video_frame in frames:
-                    array=video_frame.to_ndarray(format="bgr24")
-                    converted=time.perf_counter()
-                    with self._condition:
-                        self._latest=(array,arrived,converted,packet.pts)
-                        self._sequence+=1
-                        self.metrics["frames"]+=1
-                        self.metrics["decode_ms"].append((decoded-arrived)*1000)
-                        self.metrics["convert_ms"].append((converted-decoded)*1000)
-                        self.metrics["packet_pts_us"]=packet.pts
-                        self.metrics["packet_received_at"]=arrived
-                        self._condition.notify_all()
         except Exception as exc:
             if not self._closed:
                 with self._condition:
                     self._error=exc
                     self._condition.notify_all()
+
+    def _frame_loop(self):
+        try:
+            output=self.decoder_process.stdout
+            if output is None:
+                raise StreamUnavailable("decoder stdout unavailable")
+            while not self._closed:
+                header=_read_exact(output,24)
+                w,h,pts,decode_ms,convert_ms=struct.unpack(">IIQff",header)
+                if (w,h)!=self.video_size:
+                    raise StreamUnavailable(f"decoder frame size changed to {w}x{h}")
+                raw=_read_exact(output,w*h*3)
+                array=np.frombuffer(raw,dtype=np.uint8).reshape((h,w,3))
+                arrived=time.perf_counter()
+                with self._condition:
+                    self._latest=(array,arrived,arrived,pts)
+                    self._sequence+=1
+                    self.metrics["frames"]+=1
+                    self.metrics["decode_ms"].append(decode_ms)
+                    self.metrics["convert_ms"].append(convert_ms)
+                    self.metrics["packet_pts_us"]=pts
+                    self.metrics["packet_received_at"]=arrived
+                    self._condition.notify_all()
+        except Exception as exc:
+            if not self._closed:
+                with self._condition:
+                    detail=self._decoder_diagnostics()
+                    self._error=StreamUnavailable(f"decoder subprocess stopped: {exc}; {detail}")
+                    self._condition.notify_all()
+
+    def _decoder_diagnostics(self):
+        process=self.decoder_process
+        status=process.poll() if process is not None else None
+        detail=f"exit={status}"
+        if self._decoder_log is not None:
+            try:
+                self._decoder_log.flush()
+                self._decoder_log.seek(0)
+                detail+=" stderr="+self._decoder_log.read(3000).decode(errors="replace")[-1500:]
+            except OSError:
+                pass
+        return detail
 
     def capture(self, timeout=.6):
         deadline=time.monotonic()+timeout
@@ -235,6 +270,14 @@ class HeadlessScrcpy:
 
     def close(self):
         self._closed=True
+        decoder,self.decoder_process=self.decoder_process,None
+        if decoder is not None:
+            if decoder.poll() is None:
+                decoder.terminate()
+                try:
+                    decoder.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    decoder.kill();decoder.wait(timeout=2)
         for name in ("video_socket","control_socket"):
             sock=getattr(self,name)
             setattr(self,name,None)
@@ -247,6 +290,13 @@ class HeadlessScrcpy:
         if self._thread is not None:
             self._thread.join(timeout=2)
             self._thread=None
+        if self._frame_thread is not None:
+            self._frame_thread.join(timeout=2)
+            self._frame_thread=None
+        if decoder is not None:
+            for stream in (decoder.stdin,decoder.stdout):
+                if stream is not None:
+                    stream.close()
         process,self.process=self.process,None
         if process is not None and process.poll() is None:
             process.terminate()
@@ -263,6 +313,9 @@ class HeadlessScrcpy:
         if self._server_log is not None:
             self._server_log.close()
             self._server_log=None
+        if self._decoder_log is not None:
+            self._decoder_log.close()
+            self._decoder_log=None
 
 
 def _hidden_process_options():
