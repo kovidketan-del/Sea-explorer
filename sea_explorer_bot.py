@@ -17,7 +17,7 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parent
-BUILD = "one-go-livefix-1"
+BUILD = "one-go-livefix-2"
 CONFIG_PATH = ROOT / "config.json"
 STATE_PATH = ROOT / "progress_state.json"
 LOG_PATH = ROOT / "sea_explorer.log"
@@ -190,8 +190,9 @@ class ADB:
 
 @dataclass
 class Progress:
+    schema_version: int = 2
     package: str = ""
-    oxygen_level_estimate: int = 170
+    oxygen_level_estimate: int = 190
     oxygen_purchases: int = 0
     bag_purchases: int = 0
     runs_completed: int = 0
@@ -202,7 +203,12 @@ class Progress:
         if STATE_PATH.exists():
             try:
                 data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-                return cls(**{k: data[k] for k in cls.__annotations__ if k in data})
+                if int(data.get("schema_version", 0)) == 2:
+                    return cls(**{k: data[k] for k in cls.__annotations__ if k in data})
+                log(
+                    "Ignoring progress_state.json from the older buggy build; "
+                    f"resetting oxygen estimate to verified live level {starting_oxygen}."
+                )
             except Exception:
                 pass
         return cls(oxygen_level_estimate=starting_oxygen)
@@ -316,7 +322,7 @@ class Vision:
         comps=self._components(mask,max(100,int(h*w*.001)))
         for x,y,bw,bh,a,cx,cy in comps:
             wr,hr=bw/w,bh/h
-            if .48 <= wr <= .92 and .11 <= hr <= .40 and .30 <= cx/w <= .70 and .35 <= cy/h <= .72:
+            if .48 <= wr <= .99 and .10 <= hr <= .42 and .30 <= cx/w <= .70 and .30 <= cy/h <= .72:
                 greens=self._green_buttons(hsv)
                 close=None
                 for gx,gy,gw,gh,ga,gcx,gcy in greens:
@@ -344,6 +350,35 @@ class Vision:
                 if best is None or score>best[0]:
                     best=(score,int(cx),int(cy))
         return None if best is None else (best[1],best[2])
+
+    def upgrade_signature(self, frame, kind: str) -> np.ndarray:
+        """Binary fingerprint of the displayed BAG/OXYGEN level digits.
+
+        Upgrade success is confirmed only when this small digit region changes.
+        This prevents a persistent HOME screen or missed NOT-ENOUGH popup from
+        being mistaken for a successful purchase.
+        """
+        h,w=frame.shape[:2]
+        if kind == "oxygen":
+            x1,x2,y1,y2 = 0.37,0.62,0.665,0.710
+        elif kind == "bag":
+            x1,x2,y1,y2 = 0.14,0.34,0.665,0.710
+        else:
+            raise ValueError(f"unknown upgrade kind: {kind}")
+
+        crop=frame[int(y1*h):int(y2*h), int(x1*w):int(x2*w)]
+        if crop.size == 0:
+            return np.zeros((48,160), np.uint8)
+        gray=cv2.cvtColor(crop,cv2.COLOR_BGR2GRAY)
+        gray=cv2.resize(gray,(160,48),interpolation=cv2.INTER_AREA)
+        _,mask=cv2.threshold(gray,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+        return mask
+
+    @staticmethod
+    def signature_delta(before: np.ndarray, after: np.ndarray) -> float:
+        if before.shape != after.shape or before.size == 0:
+            return 0.0
+        return float(np.mean(before != after))
 
     def hazards(self, frame):
         """Find the spiky purple puffer/zombie hazards, while rejecting purple pipes/coral.
@@ -526,6 +561,7 @@ class SeaExplorerBot:
         self.sweeper=Sweeper(self.adb,cfg)
         self.prev_state=None
         self.home_handled=False
+        self.last_start_attempt=0.0
         self.unknown_since=None
         self.last_recovery=0.0
 
@@ -571,50 +607,99 @@ class SeaExplorerBot:
 
     def _attempt_upgrade(self, frame, kind):
         tap=self.cfg["taps"][f"{kind}_upgrade"]
+        before_sig=self.vision.upgrade_signature(frame,kind)
         log(f"Attempting {kind} upgrade...")
         self._tap_norm(frame,tap)
         if self.dry_run:
             return False
 
         deadline=time.monotonic()+float(self.cfg["economy"]["upgrade_result_timeout_s"])
-        saw_home=False
+        best_delta=0.0
+        change_threshold=float(self.cfg["economy"].get("upgrade_signature_change_min",0.0035))
+
         while time.monotonic()<deadline:
-            time.sleep(.30)
+            time.sleep(.25)
             after=self.adb.screenshot()
             d=self.vision.detect(after)
+
             if d.state=="NOT_ENOUGH":
                 log(f"{kind}: not enough coins.")
                 self._popup_close(after,d)
                 time.sleep(.35)
                 return False
+
             if d.state=="HOME":
-                saw_home=True
-                # Successful upgrades leave us on HOME; give the price/level
-                # animation enough time to settle before counting it.
-                if time.monotonic() > deadline-.9:
-                    break
+                after_sig=self.vision.upgrade_signature(after,kind)
+                delta=self.vision.signature_delta(before_sig,after_sig)
+                best_delta=max(best_delta,delta)
+                if delta >= change_threshold:
+                    if kind=="oxygen":
+                        self.progress.oxygen_purchases += 1
+                        self.progress.oxygen_level_estimate += int(self.cfg["oxygen_step"])
+                        log(
+                            f"oxygen upgrade visually confirmed "
+                            f"(digit_delta={delta:.4f}) -> level "
+                            f"{self.progress.oxygen_level_estimate}"
+                        )
+                    else:
+                        self.progress.bag_purchases += 1
+                        log(
+                            f"bag upgrade visually confirmed "
+                            f"(digit_delta={delta:.4f}) -> "
+                            f"+{self.progress.bag_purchases} automated bag upgrades"
+                        )
+                    self.progress.save()
+                    return True
 
-        if saw_home:
-            if kind=="oxygen":
-                self.progress.oxygen_purchases += 1
-                self.progress.oxygen_level_estimate += int(self.cfg["oxygen_step"])
-                log(f"oxygen upgrade confirmed -> estimated level {self.progress.oxygen_level_estimate}")
-            else:
-                self.progress.bag_purchases += 1
-                log(f"bag upgrade confirmed -> +{self.progress.bag_purchases} automated bag upgrades")
-            self.progress.save()
-            return True
+        log(
+            f"{kind}: purchase NOT confirmed "
+            f"(level digits unchanged; best_delta={best_delta:.4f}). "
+            "Not counting it."
+        )
+        return False
 
-        log(f"{kind}: no clear HOME confirmation; not counting purchase.")
+    def _start_next_dive(self, frame) -> bool:
+        """Tap TAP TO DROP and verify that HOME actually disappears."""
+        now=time.monotonic()
+        if now-self.last_start_attempt < float(self.cfg["timing"].get("start_retry_cooldown_s",2.0)):
+            return False
+        self.last_start_attempt=now
+
+        candidates=[self.cfg["taps"]["start_run"]]
+        candidates.extend(self.cfg["taps"].get("start_run_fallbacks",[]))
+
+        for idx,pair in enumerate(candidates,1):
+            log(f"Starting next dive: TAP TO DROP attempt {idx}/{len(candidates)}.")
+            self._tap_norm(frame,pair)
+            if self.dry_run:
+                return False
+
+            deadline=time.monotonic()+float(self.cfg["timing"].get("start_verify_timeout_s",1.8))
+            while time.monotonic()<deadline:
+                time.sleep(.25)
+                after=self.adb.screenshot()
+                d=self.vision.detect(after)
+                if d.state=="PLAYING":
+                    log("Dive start visually confirmed: PLAYING.")
+                    return True
+                if d.state not in {"HOME","UNKNOWN","TRANSITION"}:
+                    log(f"Dive start left HOME -> {d.state}; handing back to state loop.")
+                    return True
+
+        log("TAP TO DROP did not start the dive; will retry without rebuying upgrades.")
         return False
 
     def _handle_home(self, frame):
-        if self.home_handled:
-            return
-        self.home_handled=True
         self.sweeper.stop()
 
         goal=int(self.cfg["goal_oxygen_level"])
+
+        # Upgrades are handled only once per HOME visit. If TAP TO DROP misses,
+        # later HOME loops retry starting the dive without spending again.
+        if self.home_handled:
+            self._start_next_dive(frame)
+            return
+        self.home_handled=True
         if self.progress.oxygen_level_estimate >= goal:
             log(f"GOAL REACHED: estimated oxygen level {self.progress.oxygen_level_estimate} >= {goal}")
             raise SystemExit(0)
@@ -642,10 +727,8 @@ class SeaExplorerBot:
             time.sleep(.25)
             frame=self.adb.screenshot()
 
-        # Drop back in for another earning run.
-        log("Starting next dive.")
-        self._tap_norm(frame,self.cfg["taps"]["start_run"])
-        time.sleep(float(self.cfg["timing"]["after_start_tap_s"]))
+        # Drop back in for another earning run, and verify it actually started.
+        self._start_next_dive(frame)
 
     def _recover_unknown(self, frame):
         now=time.monotonic()

@@ -2,12 +2,12 @@
   "package": "",
   "adb_path": "",
   "goal_oxygen_level": 2000,
-  "starting_oxygen_level": 170,
+  "starting_oxygen_level": 190,
   "oxygen_step": 10,
   "taps": {
     "start_run": [
       0.5,
-      0.42
+      0.57
     ],
     "bag_upgrade": [
       0.23,
@@ -20,6 +20,16 @@
     "popup_close_fallback": [
       0.5,
       0.64
+    ],
+    "start_run_fallbacks": [
+      [
+        0.5,
+        0.54
+      ],
+      [
+        0.5,
+        0.6
+      ]
     ]
   },
   "motion": {
@@ -39,7 +49,7 @@
   },
   "economy": {
     "max_oxygen_purchases_per_home": 8,
-    "upgrade_result_timeout_s": 1.8,
+    "upgrade_result_timeout_s": 2.4,
     "bag_every_runs": [
       {
         "until_oxygen": 500,
@@ -57,14 +67,17 @@
         "until_oxygen": 2100,
         "every_runs": 8
       }
-    ]
+    ],
+    "upgrade_signature_change_min": 0.0035
   },
   "timing": {
     "gameplay_loop_s": 0.08,
     "non_gameplay_loop_s": 0.15,
     "after_start_tap_s": 0.8,
     "after_result_tap_s": 0.8,
-    "unknown_back_after_s": 12.0,
-    "unknown_relaunch_after_s": 28.0
+    "unknown_back_after_s": 12,
+    "unknown_relaunch_after_s": 28,
+    "start_verify_timeout_s": 1.8,
+    "start_retry_cooldown_s": 2
   }
 }
