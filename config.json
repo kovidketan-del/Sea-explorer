@@ -2,7 +2,7 @@
   "package": "",
   "adb_path": "",
   "goal_oxygen_level": 2000,
-  "starting_oxygen_level": 190,
+  "starting_oxygen_level": 230,
   "oxygen_step": 10,
   "taps": {
     "start_run": [
@@ -37,20 +37,17 @@
     ]
   },
   "motion": {
-    "x_left": 0.1,
-    "x_right": 0.9,
-    "danger_radius_ratio": 0.24,
-    "sweep_swipe_ms": 28,
-    "control_y": 0.66,
-    "hazard_lanes": [
-      0.48,
-      0.58,
-      0.66,
-      0.74,
-      0.82
-    ],
-    "same_direction_repeats": 8,
-    "hazard_repeats": 2
+    "x_left": 0.05,
+    "x_right": 0.95,
+    "danger_radius_ratio": 0.12,
+    "danger_ahead_ratio": 0.40,
+    "danger_behind_ratio": 0.12,
+    "gesture_lookahead_ratio": 0.06,
+    "sweep_ms": 250,
+    "escape_ms": 180,
+    "clear_frames": 2,
+    "control_y": 0.67,
+    "scrcpy_window_title": "RMX3853"
   },
   "economy": {
     "max_oxygen_purchases_per_home": 8,
@@ -58,7 +55,7 @@
     "bag_every_runs": [
       {
         "until_oxygen": 500,
-        "every_runs": 2
+        "every_runs": 1
       },
       {
         "until_oxygen": 1000,
@@ -77,6 +74,7 @@
   },
   "timing": {
     "gameplay_loop_s": 0,
+    "playing_unknown_grace_s": 0.6,
     "non_gameplay_loop_s": 0.15,
     "after_start_tap_s": 0.8,
     "after_result_tap_s": 0.8,

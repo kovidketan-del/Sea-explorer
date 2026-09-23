@@ -3,11 +3,13 @@ SEA EXPLORER BOT — one-folder build
 
 WHAT IT DOES
 ------------
-- Uses ADB + OpenCV only.
+- Uses ADB for menus and one initial gameplay frame, then captures the visible
+  scrcpy mirror locally for fast bomb checks and continuous touch control.
 - Does NOT try to recognize every treasure.
-- Sweeps the playable area in a fast serpentine pattern.
-- Detects the spiky purple zombie/puffer hazard and diverts to a safer corner.
-- Rejects the smoother purple pipe/coral shapes seen in the supplied recordings.
+- Holds one touch down and sweeps it left/right across the playable area.
+- Detects the spiky purple zombie/puffer hazard before each crossing, parks at
+  a safe edge while it passes, and uses a short escape only if already close.
+- Rejects the red coral that previously caused false bomb evades.
 - Claims the normal end-of-run reward.
 - Closes the optional purple Win Machine instead of pressing SPIN/ad.
 - Periodically upgrades BAG SIZE because the recordings show the bag filling
@@ -24,7 +26,7 @@ costs ~563 coins. A 7-slot bag also appears to finish a run while substantial
 oxygen remains. That makes bag capacity an income bottleneck.
 
 The bot therefore:
-  Oxygen < 500:  one bag attempt every 2 completed runs
+  Oxygen < 500:  one bag attempt every completed run
   Oxygen < 1000: one bag attempt every 3 runs
   Oxygen < 1500: one bag attempt every 5 runs
   Oxygen >=1500: one bag attempt every 8 runs
@@ -33,31 +35,78 @@ At every HOME screen it then buys as many oxygen upgrades as currently
 affordable (maximum 8 in a batch). This keeps most spending directed at the
 2000-level objective without starving the income upgrade.
 
-IMPORTANT BEFORE FIRST RUN
---------------------------
-1. Install Python 3.11+.
-2. Install requirements:
+GETTING STARTED WITH THE WINDOW
+-------------------------------
+1. Install Python 3.11+ and the packages in requirements.txt:
        pip install -r requirements.txt
-3. Connect the SAME Android test phone by USB.
-4. Enable USB debugging and accept the RSA prompt.
-5. Open Sea Explorer on the phone and leave it visible.
-6. Double-click run_bot.bat.
+2. Install Android platform-tools (adb) and scrcpy. The window can be opened
+   while the phone is disconnected; set executable paths in Settings if needed.
+3. Double-click run_bot.bat to open the Sea Explorer dashboard.
+4. Choose USB or Wireless, connect to the phone, and open Sea Explorer on it.
+5. Press Start. The dashboard launches a scrcpy mirror for the selected phone.
+   Leave that mirror visible and unobstructed while the bot plays. The touch
+   driver uses the Windows pointer in the mirror, so focusing another window
+   during a held sweep stops the bot safely.
+   On smaller screens, use the Connection & dive / Checkpoints tabs. A Stop
+   button remains visible at the top while a dive is running.
 
-On the first run the script reads the foreground Android package and remembers
-it. No package name needs to be typed manually.
+The Sea Explorer Bot desktop shortcut opens the dashboard and automatically
+starts the bot on the last selected USB or Wireless device. With one authorized
+USB phone and no saved selection, it chooses that phone. If the selected phone
+is unavailable, the dashboard stays open so you can connect it manually.
+Run create_desktop_shortcut.ps1 to recreate the shortcut after moving this
+folder. The custom icon is sea_explorer.ico.
+
+USB: enable USB debugging in Android developer options, connect the cable,
+unlock the phone, accept the RSA prompt, then use Refresh and Connect in the
+dashboard. Choose the exact authorized device if multiple are listed.
+
+Wireless: enable Wireless debugging in Android developer options. If the phone
+has not been paired with this PC, choose "Pair device with pairing code" on
+the phone, enter its pairing address and six-digit code in the dashboard, and
+press Pair. Then enter the phone's regular wireless debugging IP:port address
+and press Connect. The pairing and connection ports can differ. Pairing codes
+are not saved. Wireless debugging may need a new address after reconnecting
+to Wi-Fi. A previously paired phone can usually go straight to Connect.
+
+On the first run the bot reads the foreground Android package and remembers it.
+No package name needs to be typed manually.
+
+CHECKPOINTS
+-----------
+The dashboard shows the requested milestones:
+
+  #2    Reach 300 meter      15 Coins
+  #3    Reach 400 meter      34 Coins
+  #4    Reach 500 meter      48 Coins
+  #5    Reach 600 meter     472 Coins
+  #6    Reach 700 meter     472 Coins
+  #7    Reach 900 meter    4719 Coins
+  #8   Reach 1000 meter   14157 Coins
+  #9   Reach 2000 meter   94380 Coins
+
+Use the Mark reached control when the game confirms a milestone. These marks
+are saved locally and can be changed later. They are manual because the bot
+does not currently read the game's depth counter or verify coin payouts.
 
 CURRENT STARTING LEVEL
 ----------------------
 config.json currently has:
-    "starting_oxygen_level": 170
+    "starting_oxygen_level": 230
 
-That matches the end of the supplied recording. If you manually buy more oxygen
-BEFORE the bot's first run, change this number to your actual displayed Oxygen
-Level. Once the bot starts buying upgrades itself, leave progress_state.json
-alone; it tracks successful purchases.
+The saved progress_state.json currently shows Oxygen Level 230. If you buy
+oxygen manually later, update the saved oxygen
+estimate to match the displayed level. After that, the bot tracks its own
+confirmed purchases.
 
 SAFETY / TEST MODE
 ------------------
+For command-line use without the dashboard, open an unobstructed scrcpy mirror
+yourself and run sea_explorer_bot.py. With multiple ADB devices, select exactly
+one using --serial; --window-title must match that mirror's title. The
+--transport wireless option avoids the USB stay-awake command. For example:
+    python sea_explorer_bot.py --serial 192.0.2.10:5555 --transport wireless --window-title "Sea Explorer Mirror"
+
 To watch detection without any taps/movement:
     python sea_explorer_bot.py --dry-run
 
@@ -73,19 +122,32 @@ collectibles are acquired by contact, recognizing every item is unnecessary.
 A dense sweep covers the screen regardless of treasure artwork. The only
 important visual problem is avoiding the dangerous purple spiky enemy.
 
-"Super-fast finger" does not necessarily make the diver itself infinitely fast:
-the game can cap avatar speed. The script therefore sends a sequence of far
-targets rather than thousands of tiny points; this keeps the virtual finger
-moving aggressively while allowing the game physics to follow.
+The manual recording's pointer overlay stays at P:1/1 while moving from one
+edge to the other. It sweeps a narrow band around 65-70% of screen height.
+The prior controller sent many separate Android shell `motionevent` commands
+and planned two passes before looking again. On the phone that took several
+seconds, producing a slow oscillation and stale bomb decisions. The controller
+now holds one scrcpy touch, moves across 5-95% of the width in about 250 ms,
+and captures the scrcpy video before each return pass. Its normal height stays
+at 67% of the screen. Bombs descend quickly from above, so one approaching
+that band pauses the sweep at a safe edge; a short vertical escape is reserved
+for a close threat. Two clear frames are required before sweeping resumes.
 
 FILES
 -----
 sea_explorer_bot.py   main program
+sea_explorer_ui.py    dashboard with connection, progress, and checkpoints
+connection_manager.py USB/wireless ADB connection helpers
+checkpoint_state.py   milestone definitions and saved marks
+scrcpy_touch.py       continuous Windows touch driver for scrcpy
+scrcpy_capture.py     fast local video capture from scrcpy
 config.json           goal, economy policy, coordinates, timing
-run_bot.bat           one-click Windows launcher
+run_bot.bat           one-click dashboard launcher
 dry_run.bat           no-touch detector test
 requirements.txt      Python packages
 progress_state.json   created automatically after first run
+checkpoint_state.json created when milestone marks are changed
+ui_settings.json      created when dashboard preferences are saved
 sea_explorer.log      created automatically
 
 

@@ -1,7 +1,10 @@
 @echo off
 cd /d "%~dp0"
-title Sea Explorer Bot
-python sea_explorer_bot.py
-echo.
-echo Bot exited with code %ERRORLEVEL%.
-pause
+title Sea Explorer Control Deck
+where py >nul 2>&1
+if %ERRORLEVEL% EQU 0 (
+    py -3 sea_explorer_ui.py
+) else (
+    python sea_explorer_ui.py
+)
+if errorlevel 1 pause

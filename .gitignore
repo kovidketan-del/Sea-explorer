@@ -2,4 +2,6 @@ __pycache__/
 *.pyc
 sea_explorer.log
 progress_state.json
+checkpoint_state.json
+ui_settings.json
 *.tmp

@@ -14,10 +14,12 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from scrcpy_touch import ScrcpyTouch
+from scrcpy_capture import ScrcpyCapture
 
 
 ROOT = Path(__file__).resolve().parent
-BUILD = "one-go-livefix-4"
+BUILD = "scrcpy-sweep-7"
 CONFIG_PATH = ROOT / "config.json"
 STATE_PATH = ROOT / "progress_state.json"
 LOG_PATH = ROOT / "sea_explorer.log"
@@ -25,6 +27,10 @@ LOG_PATH = ROOT / "sea_explorer.log"
 
 class BotError(RuntimeError):
     pass
+
+
+class StopRequested(BotError):
+    """The dashboard requested a clean stop."""
 
 
 def log(msg: str) -> None:
@@ -51,7 +57,6 @@ class ADB:
     def __init__(self, configured_path: str = ""):
         self.adb = self._find_adb(configured_path)
         self.serial = None
-        self._motionevent = None
 
     @staticmethod
     def _find_adb(configured_path: str) -> str:
@@ -120,8 +125,13 @@ class ADB:
                 result.append((a.strip(), b.strip()))
         return result
 
-    def ensure_ready(self):
+    def ensure_ready(self, requested_serial=None):
         ready = [s for s, st in self.devices() if st == "device"]
+        if requested_serial:
+            if requested_serial not in ready:
+                raise BotError(f"Selected device {requested_serial!r} is not connected and authorized.")
+            self.serial = requested_serial
+            return
         if not ready:
             raise BotError("No authorized Android device. Connect USB, enable USB debugging, unlock the phone, and accept the RSA prompt.")
         if len(ready) > 1:
@@ -141,40 +151,6 @@ class ADB:
 
     def back(self):
         self.run("shell", "input", "keyevent", "BACK")
-
-    def motionevent(self, action, x, y, check=True):
-        return self.run("shell", "input", "motionevent", action.upper(), int(x), int(y), check=check)
-
-    def swipe(self, x1, y1, x2, y2, ms=90):
-        self.run("shell", "input", "touchscreen", "swipe", int(x1), int(y1), int(x2), int(y2), int(ms))
-
-    def swipe_burst(self, x1, y1, x2, y2, ms=32, repeats=6):
-        """Send several same-direction swipes in ONE adb shell session.
-
-        A separate adb process per swipe adds a visible pause. Bundling the
-        commands removes the PC<->phone round-trip between strokes while still
-        using Android's real interpolated swipe gesture.
-        """
-        repeats=max(1,min(12,int(repeats)))
-        ms=max(20,min(180,int(ms)))
-        one=(
-            f"input touchscreen swipe {int(x1)} {int(y1)} "
-            f"{int(x2)} {int(y2)} {ms}"
-        )
-        command="; ".join([one]*repeats)
-        self.run("shell","sh","-c",command,timeout=max(5,2+repeats*ms/1000.0))
-
-    def supports_motionevent(self):
-        if self._motionevent is not None:
-            return self._motionevent
-        try:
-            r1 = subprocess.run(self._cmd("shell","input","motionevent","DOWN","1","1"), capture_output=True, text=True, timeout=5)
-            r2 = subprocess.run(self._cmd("shell","input","motionevent","UP","1","1"), capture_output=True, text=True, timeout=5)
-            bad = (r1.stdout+r1.stderr+r2.stdout+r2.stderr).lower()
-            self._motionevent = r1.returncode == 0 and r2.returncode == 0 and "unknown" not in bad and "usage:" not in bad
-        except Exception:
-            self._motionevent = False
-        return self._motionevent
 
     def foreground_package(self):
         for args in [
@@ -208,7 +184,7 @@ class ADB:
 class Progress:
     schema_version: int = 2
     package: str = ""
-    oxygen_level_estimate: int = 190
+    oxygen_level_estimate: int = 210
     oxygen_purchases: int = 0
     bag_purchases: int = 0
     runs_completed: int = 0
@@ -427,7 +403,8 @@ class Vision:
         """
         hsv=self._hsv(frame)
         H,S,V=cv2.split(hsv)
-        mask=((H>=125)&(H<=179)&(S>=70)&(V>=50)).astype(np.uint8)*255
+        # The bomb is violet (H ~141); red coral near H 177 caused false evades.
+        mask=((H>=125)&(H<=155)&(S>=70)&(V>=50)).astype(np.uint8)*255
         h,w=mask.shape
         mask[:int(.07*h)]=0
         mask[int(.93*h):]=0
@@ -492,32 +469,37 @@ class Vision:
 
 
 class Sweeper:
-    """High-rate left/right steering that matches the manual strategy.
+    """One fast observed pass at a time, with a held touch and bomb parking."""
 
-    Key detail: the diver cannot physically cross the screen in 30-50 ms.
-    Reversing every tiny swipe makes it dither around the wrong phase. We
-    therefore send a BURST of several very fast swipes in the SAME direction,
-    then reverse the next burst. The finger gesture is extremely fast, while
-    the repeated directional impulses give the diver time to reach each side.
-
-    Normal play stays on one horizontal lane; vertical motion comes from the
-    game's scrolling. Only a detected purple hazard is allowed to move the
-    control lane temporarily up/down.
-    """
-
-    def __init__(self, adb: ADB, cfg: dict):
-        self.adb=adb
+    def __init__(self, touch: ScrcpyTouch, cfg: dict):
+        self.touch=touch
         self.cfg=cfg
-        self.go_right=True
         self.last_target=None
-        self.control_y=float(cfg["motion"].get("control_y",0.66))
-        self.current_lane=self.control_y
+        self.active=False
+        self.release_failed=False
+        self.control_y=float(cfg["motion"].get("control_y",0.67))
         self.swipes_sent=0
+        self.blocked=False
+        self.clear_frames=0
+        self.escape_y=None
 
     def stop(self):
+        release_error=None
+        if self.active:
+            try:
+                self.touch.release()
+            except Exception as e:
+                self.release_failed=True
+                release_error=e
+                log(f"Could not release held touch: {e}")
+        self.active=False
         self.last_target=None
-        self.go_right=True
-        self.current_lane=self.control_y
+        self.blocked=False
+        self.clear_frames=0
+        self.escape_y=None
+        self.swipes_sent=0
+        if release_error is not None:
+            raise BotError("Could not release the held touch; stopping bot") from release_error
 
     def _px(self, norm, w, h):
         return (
@@ -525,92 +507,144 @@ class Sweeper:
             int(clamp(float(norm[1]),.08,.92)*h),
         )
 
-    def _choose_safe_lane(self, hazards, h):
-        """Pick a horizontal lane farthest from the purple hazard centers."""
-        lanes=[float(v) for v in self.cfg["motion"].get(
-            "hazard_lanes",[0.48,0.58,0.66,0.74,0.82]
-        )]
-        if not hazards:
-            return self.control_y
+    @staticmethod
+    def _clearance(start, end, hazards, margin):
+        """Smallest distance from a complete stroke to a hazard's safe edge."""
+        ax,ay=start; bx,by=end
+        dx=bx-ax; dy=by-ay
+        length2=dx*dx+dy*dy
+        best=float("inf")
+        for hx,hy,radius in hazards:
+            t=clamp(((hx-ax)*dx+(hy-ay)*dy)/length2,0.0,1.0) if length2 else 0.0
+            distance=math.hypot(hx-(ax+t*dx),hy-(ay+t*dy))
+            best=min(best,distance-radius-margin)
+        return best
 
-        best=None
-        for lane in lanes:
-            y=lane*h
-            # Purple enemy avoidance is mainly vertical here because the next
-            # burst traverses almost the entire screen horizontally.
-            clearance=min(abs(y-hy)-hr for _,hy,hr in hazards)
-            # Prefer staying close to the normal lane when equally safe.
-            score=clearance-0.10*abs(lane-self.control_y)*h
-            if best is None or score>best[0]:
-                best=(score,lane)
-        return best[1]
+    def _threats(self, hazards, h):
+        """Bombs descend through the diver's row; watch above it before arrival."""
+        m=self.cfg["motion"]
+        row=self.control_y*h
+        ahead=float(m.get("danger_ahead_ratio",.40))*h
+        behind=float(m.get("danger_behind_ratio",.12))*h
+        return tuple(v for v in hazards if row-ahead <= v[1] <= row+behind)
+
+    @staticmethod
+    def _horizontal_clearance(x, hazards, margin):
+        return min(abs(x-hx)-radius-margin for hx,_,radius in hazards)
 
     def step(self, frame, hazards, dry_run=False):
         h,w=frame.shape[:2]
         m=self.cfg["motion"]
-        left=float(m["x_left"])
-        right=float(m["x_right"])
+        start=self.last_target or self._px((.5,self.control_y),w,h)
+        row_y=int(self.control_y*h)
+        left=self._px((m["x_left"],self.control_y),w,h)[0]
+        right=self._px((m["x_right"],self.control_y),w,h)[0]
+        threats=self._threats(hazards,h)
+        margin=float(m.get("danger_radius_ratio",.12))*w
+        end=start
+        reason="HOLD"
+        duration_ms=int(m.get("sweep_ms",250))
 
-        # Fast gesture, but enough same-direction repetitions for the diver to
-        # actually traverse before we reverse direction.
-        swipe_ms=max(20,min(90,int(m.get("sweep_swipe_ms",28))))
-        repeats=max(1,min(12,int(
-            m.get("hazard_repeats",2) if hazards
-            else m.get("same_direction_repeats",8)
-        )))
+        if threats:
+            self.blocked=True
+            self.clear_frames=0
+            if self.escape_y is not None:
+                reason="PARK-ESCAPED"
+            elif self._horizontal_clearance(start[0],threats,margin) > 0:
+                reason="PARK-SAFE"
+            else:
+                safe_edge=max((left,right),key=lambda x:self._horizontal_clearance(x,threats,margin))
+                candidate=(safe_edge,start[1])
+                lookahead=float(m.get("gesture_lookahead_ratio",.06))*h
+                if (self._horizontal_clearance(safe_edge,threats,margin)>0
+                    and self._clearance(start,candidate,threats,margin+lookahead)>0):
+                    end=candidate
+                    reason="PARK-MOVE"
+                else:
+                    nearest=min(threats,key=lambda v:math.dist(start,(v[0],v[1])))
+                    escape_y=.52 if nearest[1]>start[1] else .82
+                    candidate=(start[0],int(escape_y*h))
+                    start_clear=self._clearance(start,start,threats,margin)
+                    path_clear=self._clearance(start,candidate,threats,margin)
+                    end_clear=self._clearance(candidate,candidate,threats,margin)
+                    if end_clear>start_clear and path_clear>=start_clear-2:
+                        end=candidate
+                        self.escape_y=escape_y
+                        reason="ESCAPE"
+                        duration_ms=int(m.get("escape_ms",180))
+                    else:
+                        reason="HOLD-TRAPPED"
+        elif self.blocked:
+            self.clear_frames+=1
+            if self.clear_frames<int(m.get("clear_frames",2)):
+                reason="PARK-CONFIRM"
+            else:
+                self.blocked=False
+                self.clear_frames=0
+                if self.escape_y is not None:
+                    end=(start[0],row_y)
+                    self.escape_y=None
+                    reason="RETURN-LANE"
+                    duration_ms=int(m.get("escape_ms",180))
+        if not self.blocked and end==start:
+            opposite=right if start[0] <= (left+right)/2 else left
+            end=(opposite,row_y)
+            reason="SWEEP"
 
-        self.current_lane=self._choose_safe_lane(hazards,h)
-        y=int(self.current_lane*h)
-        if self.go_right:
-            start=self._px((left,self.current_lane),w,h)
-            end=self._px((right,self.current_lane),w,h)
-            direction="RIGHT"
-        else:
-            start=self._px((right,self.current_lane),w,h)
-            end=self._px((left,self.current_lane),w,h)
-            direction="LEFT"
-
-        if not dry_run:
-            self.adb.swipe_burst(
-                start[0],y,end[0],y,
-                ms=swipe_ms,
-                repeats=repeats,
-            )
-
-        self.last_target=end
-        self.swipes_sent+=repeats
-        self.go_right=not self.go_right
-
-        if hazards:
-            reason=(
-                f"EVADE-{direction} x{repeats} {swipe_ms}ms "
-                f"lane={self.current_lane:.2f} hazards={len(hazards)}"
-            )
-        else:
-            reason=(
-                f"TURBO-{direction} x{repeats} {swipe_ms}ms "
-                f"lane={self.current_lane:.2f}"
-            )
-        return reason,end
+        if not dry_run and not self.active:
+            self.touch.begin(*start,w,h)
+            self.active=True
+        if end!=start:
+            if not dry_run:
+                self.touch.move_to(*end,duration_ms,w,h)
+            self.last_target=end
+            if reason=="SWEEP":
+                self.swipes_sent+=1
+        return f"{reason} held hazards={len(hazards)} threats={len(threats)}",end
 
 
 class SeaExplorerBot:
-    def __init__(self, cfg, dry_run=False):
+    def __init__(self, cfg, dry_run=False, *, serial=None, window_title=None,
+                 stop_event=None, transport=None):
         self.cfg=cfg
         self.dry_run=dry_run
+        self.stop_event=stop_event
         self.adb=ADB(cfg.get("adb_path",""))
-        self.adb.ensure_ready()
-        self.adb.keep_awake_usb()
+        self.adb.ensure_ready(serial)
+        if transport != "wireless" and ":" not in self.adb.serial:
+            self.adb.keep_awake_usb()
         self.vision=Vision(cfg)
         self.progress=Progress.load(int(cfg["starting_oxygen_level"]))
-        self.sweeper=Sweeper(self.adb,cfg)
+        title=window_title or cfg["motion"].get("scrcpy_window_title","RMX3853")
+        self.sweeper=Sweeper(None if dry_run else ScrcpyTouch(title),cfg)
+        self.capture_title=title
+        self.capture=None
         self.prev_state=None
+        self.playing_unknown_since=None
         self.home_handled=False
         self.last_start_attempt=0.0
         self.unknown_since=None
         self.last_recovery=0.0
 
+    def _check_stop(self):
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise StopRequested("Stop requested from dashboard")
+
+    def _sleep(self, seconds):
+        self._check_stop()
+        if self.stop_event is None:
+            time.sleep(seconds)
+        elif self.stop_event.wait(max(0.0,float(seconds))):
+            raise StopRequested("Stop requested from dashboard")
+
+    def _frame(self):
+        self._check_stop()
+        if self.capture is not None and self.sweeper.active:
+            return self.capture.capture()
+        return self.adb.screenshot()
+
     def _tap_norm(self, frame, pair):
+        self._check_stop()
         h,w=frame.shape[:2]
         x=int(float(pair[0])*w); y=int(float(pair[1])*h)
         if self.dry_run:
@@ -643,6 +677,7 @@ class SeaExplorerBot:
         return int(tiers[-1]["every_runs"])
 
     def _popup_close(self, frame, det):
+        self._check_stop()
         if det.popup_close:
             x,y=det.popup_close
             if self.dry_run: log(f"DRY close popup ({x},{y})")
@@ -651,6 +686,7 @@ class SeaExplorerBot:
             self._tap_norm(frame,self.cfg["taps"]["popup_close_fallback"])
 
     def _attempt_upgrade(self, frame, kind):
+        self._check_stop()
         tap=self.cfg["taps"][f"{kind}_upgrade"]
         before_sig=self.vision.upgrade_signature(frame,kind)
         log(f"Attempting {kind} upgrade...")
@@ -663,14 +699,14 @@ class SeaExplorerBot:
         change_threshold=float(self.cfg["economy"].get("upgrade_signature_change_min",0.0035))
 
         while time.monotonic()<deadline:
-            time.sleep(.25)
+            self._sleep(.25)
             after=self.adb.screenshot()
             d=self.vision.detect(after)
 
             if d.state=="NOT_ENOUGH":
                 log(f"{kind}: not enough coins.")
                 self._popup_close(after,d)
-                time.sleep(.35)
+                self._sleep(.35)
                 return False
 
             if d.state=="HOME":
@@ -705,6 +741,7 @@ class SeaExplorerBot:
 
     def _start_next_dive(self, frame) -> bool:
         """Tap TAP TO DROP and verify that HOME actually disappears."""
+        self._check_stop()
         now=time.monotonic()
         if now-self.last_start_attempt < float(self.cfg["timing"].get("start_retry_cooldown_s",2.0)):
             return False
@@ -714,6 +751,7 @@ class SeaExplorerBot:
         candidates.extend(self.cfg["taps"].get("start_run_fallbacks",[]))
 
         for idx,pair in enumerate(candidates,1):
+            self._check_stop()
             log(f"Starting next dive: TAP TO DROP attempt {idx}/{len(candidates)}.")
             self._tap_norm(frame,pair)
             if self.dry_run:
@@ -721,11 +759,15 @@ class SeaExplorerBot:
 
             deadline=time.monotonic()+float(self.cfg["timing"].get("start_verify_timeout_s",1.8))
             while time.monotonic()<deadline:
-                time.sleep(.25)
+                self._sleep(.25)
                 after=self.adb.screenshot()
                 d=self.vision.detect(after)
                 if d.state=="PLAYING":
-                    log("Dive start visually confirmed: PLAYING.")
+                    # The HUD appears before the fading HOME animation is
+                    # finished. A stroke during that transition can be ignored,
+                    # leaving the next touch-down at the wrong edge.
+                    self._sleep(float(self.cfg["timing"].get("after_start_tap_s",.8)))
+                    log("Dive start visually confirmed: PLAYING; animation settled.")
                     return True
                 if d.state not in {"HOME","UNKNOWN","TRANSITION"}:
                     log(f"Dive start left HOME -> {d.state}; handing back to state loop.")
@@ -735,6 +777,7 @@ class SeaExplorerBot:
         return False
 
     def _handle_home(self, frame):
+        self._check_stop()
         self.sweeper.stop()
 
         goal=int(self.cfg["goal_oxygen_level"])
@@ -757,25 +800,27 @@ class SeaExplorerBot:
             # Bag is the income engine. In the recordings, 7 slots fill long
             # before 170 oxygen is exhausted, so invest periodically.
             self._attempt_upgrade(frame,"bag")
-            time.sleep(.35)
+            self._sleep(.35)
             frame=self.adb.screenshot()
 
         # Oxygen is the actual objective. Spend as much as currently affordable,
         # but cap the batch so a single HOME visit cannot loop forever.
         for _ in range(int(self.cfg["economy"]["max_oxygen_purchases_per_home"])):
+            self._check_stop()
             if self.progress.oxygen_level_estimate >= goal:
                 log(f"GOAL REACHED: estimated oxygen level {self.progress.oxygen_level_estimate} >= {goal}")
                 raise SystemExit(0)
             ok=self._attempt_upgrade(frame,"oxygen")
             if not ok:
                 break
-            time.sleep(.25)
+            self._sleep(.25)
             frame=self.adb.screenshot()
 
         # Drop back in for another earning run, and verify it actually started.
         self._start_next_dive(frame)
 
     def _recover_unknown(self, frame):
+        self._check_stop()
         now=time.monotonic()
         if self.unknown_since is None:
             self.unknown_since=now
@@ -806,16 +851,29 @@ class SeaExplorerBot:
         last_status=0.0
         try:
             while True:
-                frame=self.adb.screenshot()
+                self._check_stop()
+                frame=self._frame()
                 det=self.vision.detect(frame)
                 now=time.monotonic()
+
+                # One unreadable gameplay frame must not lift and restart the
+                # finger. The next local mirror frame arrives quickly.
+                if det.state=="UNKNOWN" and self.prev_state=="PLAYING":
+                    if self.playing_unknown_since is None:
+                        self.playing_unknown_since=now
+                    grace=float(self.cfg["timing"].get("playing_unknown_grace_s",.6))
+                    if now-self.playing_unknown_since<grace:
+                        self._sleep(.03)
+                        continue
+                else:
+                    self.playing_unknown_since=None
 
                 if det.state!="UNKNOWN":
                     self.unknown_since=None
 
                 if det.state != self.prev_state:
                     log(f"STATE {self.prev_state or '-'} -> {det.state} conf={det.confidence:.2f}")
-                    if self.prev_state=="PLAYING" and det.state in {"RESULT","TRANSITION"}:
+                    if self.prev_state=="PLAYING" and det.state in {"RESULT","TRANSITION","WIN_MACHINE","HOME"}:
                         self.progress.runs_completed += 1
                         self.progress.save()
                         log(f"Completed run #{self.progress.runs_completed}")
@@ -825,10 +883,13 @@ class SeaExplorerBot:
 
                 if det.state=="PLAYING":
                     reason,target=self.sweeper.step(frame,det.hazards,self.dry_run)
+                    if not self.dry_run and self.capture is None:
+                        self.capture=ScrcpyCapture(
+                            self.capture_title,(frame.shape[1],frame.shape[0]))
                     if now-last_status>=1.0:
                         log(f"{reason} target={target} hazards={len(det.hazards)}")
                         last_status=now
-                    time.sleep(float(self.cfg["timing"]["gameplay_loop_s"]))
+                    self._sleep(float(self.cfg["timing"]["gameplay_loop_s"]))
                     continue
 
                 self.sweeper.stop()
@@ -840,25 +901,32 @@ class SeaExplorerBot:
                         log(f"Claiming run reward at {det.orange_button}")
                         if not self.dry_run:
                             self.adb.tap(*det.orange_button)
-                        time.sleep(float(self.cfg["timing"]["after_result_tap_s"]))
+                        self._sleep(float(self.cfg["timing"]["after_result_tap_s"]))
                 elif det.state=="WIN_MACHINE":
                     log("Closing optional Win Machine; never pressing SPIN/ad.")
                     self._popup_close(frame,det)
-                    time.sleep(.6)
+                    self._sleep(.6)
                 elif det.state=="NOT_ENOUGH":
                     self._popup_close(frame,det)
-                    time.sleep(.4)
+                    self._sleep(.4)
                 elif det.state=="UNKNOWN":
                     self._recover_unknown(frame)
                 else:
                     # RESULT animations/loading should be allowed to settle.
-                    time.sleep(.35)
+                    self._sleep(.35)
 
-                time.sleep(float(self.cfg["timing"]["non_gameplay_loop_s"]))
+                self._sleep(float(self.cfg["timing"]["non_gameplay_loop_s"]))
         finally:
-            self.sweeper.stop()
-            self.progress.save()
-            log("STOP; touch released and progress saved.")
+            try:
+                self.sweeper.stop()
+            finally:
+                if self.capture is not None:
+                    self.capture.close()
+                self.progress.save()
+                if self.sweeper.release_failed:
+                    log("STOP; touch release failed; progress saved.")
+                else:
+                    log("STOP; touch released and progress saved.")
 
 
 def analyze_video(path, cfg, every_s=1.0):
@@ -900,6 +968,9 @@ def main():
     p.add_argument("--dry-run",action="store_true",help="detect/plan but do not tap or move")
     p.add_argument("--analyze-video",metavar="MP4",help="offline diagnostic against a recording; no phone required")
     p.add_argument("--sample-every",type=float,default=1.0,help="seconds between offline video samples")
+    p.add_argument("--serial",help="exact authorized ADB serial to control")
+    p.add_argument("--transport",choices=("usb","wireless"),help="selected connection transport")
+    p.add_argument("--window-title",help="exact scrcpy window title for touch and video")
     args=p.parse_args()
 
     cfg=load_config()
@@ -908,7 +979,11 @@ def main():
         return 0
 
     try:
-        SeaExplorerBot(cfg,dry_run=args.dry_run).run()
+        SeaExplorerBot(cfg,dry_run=args.dry_run,serial=args.serial,
+                       transport=args.transport,window_title=args.window_title).run()
+        return 0
+    except StopRequested:
+        print("Stopped.")
         return 0
     except SystemExit as e:
         return int(e.code or 0)
