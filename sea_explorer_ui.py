@@ -874,14 +874,14 @@ class SeaExplorerWindow:
     def _stop_bot(self):
         if self.stop_event is not None:
             self.stop_event.set()
-            self._set_status("Stop requested. Releasing the held touch…")
+            self._set_status("Stop requested. Stopping ADB Direct control…")
 
     def _on_close(self):
         if self.running or self.busy:
             self.closing = True
             if self.running:
                 self._stop_bot()
-                self._set_status("Waiting for the bot to release touch before closing…")
+                self._set_status("Waiting for ADB Direct control to stop before closing…")
             else:
                 self._set_status("Waiting for the connection operation before closing…")
         else:

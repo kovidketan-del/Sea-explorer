@@ -19,68 +19,34 @@ class RecordingQueue:
         self.events.append(("event", item[0]))
 
 
-class FakeMirrorProcess:
-    def __init__(self, events, *, timeout_on_first_wait=False):
-        self.events = events
-        self.running = True
-        self.timeout_on_first_wait = timeout_on_first_wait
-        self.wait_count = 0
-
-    def poll(self):
-        return None if self.running else 0
-
-    def terminate(self):
-        self.events.append(("mirror", "terminate"))
-        if not self.timeout_on_first_wait:
-            self.running = False
-
-    def kill(self):
-        self.events.append(("mirror", "kill"))
-        self.running = False
-
-    def wait(self, timeout):
-        self.wait_count += 1
-        self.events.append(("mirror", "wait"))
-        if self.timeout_on_first_wait and self.wait_count == 1:
-            raise ui.subprocess.TimeoutExpired("scrcpy", timeout)
-        return 0
-
-
-class MirrorShutdownTests(unittest.TestCase):
-    def _run_worker(self, *, first_wait_times_out=False):
+class DirectADBWorkerTests(unittest.TestCase):
+    def test_bot_worker_runs_without_scrcpy(self):
         events = []
-        proc = FakeMirrorProcess(events, timeout_on_first_wait=first_wait_times_out)
         window = ui.SeaExplorerWindow.__new__(ui.SeaExplorerWindow)
         window.events = RecordingQueue(events)
         stop_event = threading.Event()
 
-        with patch.object(ui.subprocess, "Popen", return_value=proc) as popen, \
-             patch.object(ui, "ScrcpyTouch") as touch, \
-             patch.object(ui, "SeaExplorerBot") as bot:
+        with patch.object(ui, "SeaExplorerBot") as bot:
             bot.return_value.run.side_effect = lambda: events.append(("bot", "run"))
-            touch.return_value._window.return_value = object()
-            window._bot_worker({}, "USB123", "usb", "Test Mirror", "scrcpy.exe",
-                               (0, 0, 300, 700), stop_event)
+            window._bot_worker({}, "USB123", "usb", stop_event)
 
-        popen.assert_called_once()
         self.assertIn(("event", "bot_started"), events)
         self.assertIn(("bot", "run"), events)
         self.assertTrue(stop_event.is_set())
         self.assertEqual(events[-1], ("event", "bot_done"))
-        self.assertLess(events.index(("mirror", "wait")), events.index(("event", "bot_done")))
-        return events
 
-    def test_bot_done_follows_owned_mirror_terminate_and_wait(self):
-        events = self._run_worker()
-        self.assertLess(events.index(("mirror", "terminate")),
-                        events.index(("mirror", "wait")))
+    def test_stop_request_is_clean(self):
+        events = []
+        window = ui.SeaExplorerWindow.__new__(ui.SeaExplorerWindow)
+        window.events = RecordingQueue(events)
+        stop_event = threading.Event()
 
-    def test_bot_done_follows_kill_and_second_wait_after_timeout(self):
-        events = self._run_worker(first_wait_times_out=True)
-        self.assertEqual(events.count(("mirror", "wait")), 2)
-        self.assertEqual(events[-3:], [
-            ("mirror", "kill"), ("mirror", "wait"), ("event", "bot_done"),
-        ])
+        with patch.object(ui, "SeaExplorerBot") as bot:
+            bot.return_value.run.side_effect = ui.StopRequested("stop")
+            window._bot_worker({}, "USB123", "usb", stop_event)
+
+        self.assertTrue(stop_event.is_set())
+        self.assertEqual(events[-1], ("event", "bot_done"))
 
 
 class ConnectionCloseTests(unittest.TestCase):
