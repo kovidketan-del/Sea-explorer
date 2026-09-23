@@ -68,6 +68,43 @@ def _save_settings(data: dict) -> None:
     os.replace(temporary, SETTINGS_PATH)
 
 
+def _runtime_motion_values(config: dict, settings: dict) -> tuple[int, float, float]:
+    """Resolve persisted UI motion controls with safe fallbacks."""
+    motion=config.get("motion",{})
+    try:
+        speed=int(settings.get("sweep_ms",motion.get("sweep_ms",110)))
+    except (TypeError,ValueError):
+        speed=int(motion.get("sweep_ms",110))
+    speed=max(10,min(1000,speed))
+
+    try:
+        left=float(settings.get("swipe_left_percent",float(motion.get("x_left",.05))*100))
+        right=float(settings.get("swipe_right_percent",float(motion.get("x_right",.95))*100))
+    except (TypeError,ValueError):
+        left=float(motion.get("x_left",.05))*100
+        right=float(motion.get("x_right",.95))*100
+
+    left=max(2.0,min(49.0,left))
+    right=max(51.0,min(98.0,right))
+    if right-left<10.0:
+        left=max(2.0,min(left,44.0))
+        right=min(98.0,max(right,left+10.0))
+    return speed,left/100.0,right/100.0
+
+
+def _apply_runtime_settings(config: dict, settings: dict) -> None:
+    motion=config.setdefault("motion",{})
+    speed,left,right=_runtime_motion_values(config,settings)
+    motion["sweep_ms"]=speed
+    motion["x_left"]=left
+    motion["x_right"]=right
+
+    economy=config.setdefault("economy",{})
+    economy["buy_upgrades"]=bool(settings.get("buy_upgrades",False))
+    mode=str(settings.get("upgrade_mode","smart")).lower()
+    economy["upgrade_mode"]=mode if mode in {"smart","bag","oxygen"} else "smart"
+
+
 def _find_scrcpy(configured: str = "") -> str:
     candidates: list[Path] = []
     if configured:
@@ -787,17 +824,51 @@ class SeaExplorerWindow:
         dialog.configure(bg=COLORS["bg"])
         dialog.transient(self.root)
         dialog.resizable(False,False)
-        dialog.geometry("610x430")
+        dialog.geometry("620x585")
         panel=tk.Frame(dialog,bg=COLORS["bg"],padx=22,pady=18)
         panel.pack(fill="both",expand=True)
 
         self._label(panel,"Automation settings",size=16,weight="bold").pack(anchor="w")
         self._label(
             panel,
-            "Upgrade buying is optional. When enabled, the bot reads coins and prices first; it never has to tap blindly.",
-            size=9,color="muted",wraplength=555,justify="left"
-        ).pack(anchor="w",pady=(3,14))
+            "Motion values are saved here, so you can tune the bot without editing files.",
+            size=9,color="muted",wraplength=565,justify="left"
+        ).pack(anchor="w",pady=(3,13))
 
+        # Motion controls
+        try:
+            base_cfg=load_config()
+        except Exception:
+            base_cfg={"motion":{"sweep_ms":110,"x_left":.05,"x_right":.95}}
+        speed,left_norm,right_norm=_runtime_motion_values(base_cfg,self.settings)
+        speed_var=tk.StringVar(value=str(speed))
+        left_var=tk.StringVar(value=f"{left_norm*100:.0f}")
+        right_var=tk.StringVar(value=f"{right_norm*100:.0f}")
+
+        self._label(panel,"MOVEMENT",size=9,color="aqua",weight="bold").pack(anchor="w",pady=(0,6))
+        motion_row=tk.Frame(panel,bg=COLORS["bg"])
+        motion_row.pack(fill="x",pady=(0,4))
+        motion_row.grid_columnconfigure((0,1,2),weight=1,uniform="motion")
+
+        fields=(
+            ("SWIPE TIME (MS)",speed_var),
+            ("LEFT EDGE (%)",left_var),
+            ("RIGHT EDGE (%)",right_var),
+        )
+        for col,(caption,var) in enumerate(fields):
+            cell=tk.Frame(motion_row,bg=COLORS["bg"])
+            cell.grid(row=0,column=col,sticky="ew",padx=(0 if col==0 else 5,0))
+            self._label(cell,caption,size=8,color="muted",weight="bold").pack(anchor="w",pady=(0,4))
+            self._entry(cell,var).pack(fill="x",ipady=5)
+
+        self._label(
+            panel,
+            "Lower ms = faster.  Current default is 110 ms.  Swipe area is the horizontal range; "
+            "5% → 95% means almost the full screen. Try 15% → 85% or 20% → 80% for shorter swipes.",
+            size=8,color="muted",wraplength=565,justify="left"
+        ).pack(anchor="w",pady=(2,13))
+
+        # Upgrade controls
         buy_var=tk.BooleanVar(value=bool(self.settings.get("buy_upgrades",False)))
         stored_mode=str(self.settings.get("upgrade_mode","smart"))
         mode_to_label={
@@ -820,7 +891,7 @@ class SeaExplorerWindow:
         )
         buy_check.pack(fill="x",anchor="w")
 
-        self._label(panel,"UPGRADE TYPE",size=8,color="muted",weight="bold").pack(anchor="w",pady=(8,5))
+        self._label(panel,"UPGRADE TYPE",size=8,color="muted",weight="bold").pack(anchor="w",pady=(7,4))
         upgrade_combo=ttk.Combobox(
             panel,
             textvariable=upgrade_var,
@@ -828,45 +899,67 @@ class SeaExplorerWindow:
             state="readonly",
             style="Sea.TCombobox",
         )
-        upgrade_combo.pack(fill="x",pady=(0,14))
+        upgrade_combo.pack(fill="x",pady=(0,12))
 
         def sync_upgrade_state(*_):
             upgrade_combo.configure(state="readonly" if buy_var.get() else "disabled")
         buy_var.trace_add("write",sync_upgrade_state)
         sync_upgrade_state()
 
-        self._label(panel,"Tool locations",size=12,weight="bold").pack(anchor="w",pady=(0,8))
+        self._label(panel,"Tool locations",size=12,weight="bold").pack(anchor="w",pady=(0,7))
         adb_var=tk.StringVar(value=str(self.settings.get("adb_path","")))
         scrcpy_var=tk.StringVar(value=str(self.settings.get("scrcpy_path","")))
         for caption,variable in (
             ("ADB EXECUTABLE",adb_var),
             ("SCRCPY EXECUTABLE (LEGACY / OPTIONAL)",scrcpy_var),
         ):
-            self._label(panel,caption,size=8,color="muted",weight="bold").pack(anchor="w",pady=(0,4))
+            self._label(panel,caption,size=8,color="muted",weight="bold").pack(anchor="w",pady=(0,3))
             row=tk.Frame(panel,bg=COLORS["bg"])
-            row.pack(fill="x",pady=(0,9))
-            self._entry(row,variable).pack(side="left",fill="x",expand=True,ipady=5)
+            row.pack(fill="x",pady=(0,7))
+            self._entry(row,variable).pack(side="left",fill="x",expand=True,ipady=4)
             self._button(row,"Browse",lambda v=variable:self._browse_executable(v,dialog)).pack(side="left",padx=(7,0))
 
         def save():
+            try:
+                speed_value=int(speed_var.get().strip())
+                left_value=float(left_var.get().strip())
+                right_value=float(right_var.get().strip())
+            except ValueError:
+                self._set_status("Motion settings must be numbers.", error=True)
+                return
+            if not 10<=speed_value<=1000:
+                self._set_status("Swipe time must be between 10 and 1000 ms.", error=True)
+                return
+            if not 2<=left_value<=49 or not 51<=right_value<=98:
+                self._set_status("Swipe edges must stay within 2–49% left and 51–98% right.", error=True)
+                return
+            if right_value-left_value<10:
+                self._set_status("Swipe area must be at least 10% of the screen width.", error=True)
+                return
+
             old_adb=str(self.settings.get("adb_path",""))
             old_scrcpy=str(self.settings.get("scrcpy_path",""))
             self.settings["adb_path"]=adb_var.get().strip()
             self.settings["scrcpy_path"]=scrcpy_var.get().strip()
             self.settings["buy_upgrades"]=bool(buy_var.get())
             self.settings["upgrade_mode"]=label_to_mode.get(upgrade_var.get(),"smart")
+            self.settings["sweep_ms"]=speed_value
+            self.settings["swipe_left_percent"]=left_value
+            self.settings["swipe_right_percent"]=right_value
             self._persist_settings()
+
             if old_adb!=self.settings["adb_path"] or old_scrcpy!=self.settings["scrcpy_path"]:
                 self.connected_serial=None
                 self.connected_mode=None
-                self._set_status("Tool paths saved. Reconnect the device before starting.")
+                self._set_status("Settings saved. Reconnect the device before starting.")
             else:
-                state="enabled" if self.settings["buy_upgrades"] else "disabled"
-                self._set_status(f"Settings saved. Upgrade buying is {state}.")
+                self._set_status(
+                    f"Settings saved: {speed_value} ms, {left_value:g}% → {right_value:g}%."
+                )
             self._update_controls()
             dialog.destroy()
 
-        self._button(panel,"Save settings",save,kind="aqua").pack(anchor="e",pady=(3,0))
+        self._button(panel,"Save settings",save,kind="aqua").pack(anchor="e",pady=(2,0))
         dialog.grab_set()
 
     def _browse_executable(self, variable: tk.StringVar, parent: tk.Misc):
@@ -893,10 +986,12 @@ class SeaExplorerWindow:
         serial = self.connected_serial
         mode = self.connected_mode
         config["adb_path"] = str(self.settings.get("adb_path") or config.get("adb_path", ""))
-        economy=config.setdefault("economy",{})
-        economy["buy_upgrades"]=bool(self.settings.get("buy_upgrades",False))
-        mode=str(self.settings.get("upgrade_mode","smart")).lower()
-        economy["upgrade_mode"]=mode if mode in {"smart","bag","oxygen"} else "smart"
+        _apply_runtime_settings(config,self.settings)
+        motion=config["motion"]
+        log(
+            f"UI motion settings: {motion['sweep_ms']} ms, "
+            f"{motion['x_left']*100:.0f}% -> {motion['x_right']*100:.0f}%"
+        )
         self.stop_event = threading.Event()
         self.running = True
         self._update_controls()
