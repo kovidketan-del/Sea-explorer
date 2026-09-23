@@ -50,6 +50,11 @@ class RecordedGameplayTests(unittest.TestCase):
         goal, mode, _ = self.control._plan(720, 1600, (), items, 54)
         self.assertEqual((goal, mode), (144, "COLLECT"))
 
+    def test_headless_home_title_does_not_look_like_gameplay_counters(self):
+        frame=self.frame("sea_home_headless.png")
+        self.assertEqual(frame.shape[:2],(720,324))
+        self.assertEqual(self.vision.detect(frame).state,"HOME")
+
 
 if __name__ == "__main__":
     unittest.main()

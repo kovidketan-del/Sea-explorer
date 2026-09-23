@@ -391,8 +391,13 @@ class Vision:
             cyr=cy/h
             if not (0.045 <= cyr <= 0.16 and 0.10 <= wr <= 0.33 and 0.025 <= hr <= 0.09):
                 continue
-            if cx/w < .38: left=True
-            if cx/w > .62: right=True
+            # The HOME title has orange letter fragments on both sides of
+            # center. Only the actual gameplay counters are anchored to the
+            # outer screen edges, at roughly 3%-36% and 64%-97% width.
+            if x/w <= .08 and (x+bw)/w >= .30:
+                left=True
+            if x/w <= .70 and (x+bw)/w >= .91:
+                right=True
         if left and right:
             return True
         # A falling gold/coral object can merge with one HUD into a component
