@@ -40,7 +40,7 @@
     "x_left": 0.05,
     "x_right": 0.95,
     "danger_radius_ratio": 0.12,
-    "danger_ahead_ratio": 0.48,
+    "danger_ahead_ratio": 0.58,
     "danger_behind_ratio": 0.12,
     "gesture_lookahead_ratio": 0.06,
     "sweep_ms": 110,
@@ -49,8 +49,8 @@
     "control_y": 0.67,
     "scrcpy_window_title": "RMX3853",
     "blocked_poll_s": 0.015,
-    "hazard_min_area_ratio": 0.0018,
-    "hazard_max_area_ratio": 0.03
+    "hazard_min_area_ratio": 0.0006,
+    "hazard_max_area_ratio": 0.032
   },
   "economy": {
     "max_oxygen_purchases_per_home": 8,

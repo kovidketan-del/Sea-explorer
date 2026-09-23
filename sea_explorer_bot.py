@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import struct
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -156,10 +157,47 @@ class ADB:
             raise BotError(f"Multiple devices connected: {ready}. Disconnect all but the test phone.")
         self.serial = ready[0]
 
+    @staticmethod
+    def _decode_raw_screencap(raw: bytes):
+        """Decode Android's uncompressed screencap stream when available."""
+        if not raw or len(raw)<12:
+            return None
+        try:
+            w,h,pixel_format=struct.unpack_from("<III",raw,0)
+        except struct.error:
+            return None
+        if not (16<=w<=10000 and 16<=h<=10000):
+            return None
+        pixels=w*h
+        # Android versions use either a 12-byte header or a 16-byte header
+        # (the latter adds dataspace). Most modern phones return RGBA8888.
+        for header in (12,16):
+            remaining=len(raw)-header
+            if remaining==pixels*4:
+                rgba=np.frombuffer(raw,dtype=np.uint8,count=pixels*4,offset=header)
+                rgba=rgba.reshape((h,w,4))
+                return cv2.cvtColor(rgba,cv2.COLOR_RGBA2BGR)
+            if remaining==pixels*3:
+                rgb=np.frombuffer(raw,dtype=np.uint8,count=pixels*3,offset=header)
+                rgb=rgb.reshape((h,w,3))
+                return cv2.cvtColor(rgb,cv2.COLOR_RGB2BGR)
+        return None
+
     def screenshot(self):
-        raw = self.run("exec-out", "screencap", "-p", text=False, timeout=15)
-        arr = np.frombuffer(raw, dtype=np.uint8)
-        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        # PNG encoding on the phone is relatively expensive. Try Android's raw
+        # screencap first so the purple-hazard watcher receives newer frames.
+        try:
+            raw=self.run("exec-out","screencap",text=False,timeout=8)
+            frame=self._decode_raw_screencap(raw)
+            if frame is not None:
+                return frame
+        except Exception:
+            pass
+
+        # Compatibility fallback for devices whose raw format is unsupported.
+        raw=self.run("exec-out","screencap","-p",text=False,timeout=15)
+        arr=np.frombuffer(raw,dtype=np.uint8)
+        frame=cv2.imdecode(arr,cv2.IMREAD_COLOR)
         if frame is None:
             raise BotError("Could not decode Android screenshot.")
         return frame
@@ -559,24 +597,24 @@ class Vision:
         return result
 
     def hazards(self, frame, hsv=None):
-        """Find purple spiky bombs early without touching the swipe cadence.
+        """Fast, conservative purple-bomb detector for live gameplay.
 
-        The old detector ignored the bomb until it occupied 0.6% of the whole
-        screen, which was unnecessarily late. Keep the same shape rejection for
-        pipes/coral but allow smaller, farther-away bombs to trigger avoidance.
+        Collisions are much more expensive than an occasional false avoidance,
+        so small/far violet blobs get a wider acceptance envelope than before.
+        Long purple pipes are still rejected by aspect ratio.
         """
         if hsv is None:
             hsv=self._hsv(frame)
         H=hsv[:,:,0]; S=hsv[:,:,1]; V=hsv[:,:,2]
-        mask=((H>=125)&(H<=155)&(S>=70)&(V>=50)).astype(np.uint8)*255
+        mask=((H>=123)&(H<=158)&(S>=62)&(V>=45)).astype(np.uint8)*255
         h,w=mask.shape
-        mask[:int(.07*h)]=0
-        mask[int(.93*h):]=0
+        mask[:int(.06*h)]=0
+        mask[int(.94*h):]=0
         cnts,_=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
         found=[]
         motion=self.cfg.get("motion",{})
-        min_ratio=float(motion.get("hazard_min_area_ratio",.0018))
-        max_ratio=float(motion.get("hazard_max_area_ratio",.030))
+        min_ratio=float(motion.get("hazard_min_area_ratio",.0006))
+        max_ratio=float(motion.get("hazard_max_area_ratio",.032))
         for cnt in cnts:
             area=float(cv2.contourArea(cnt))
             if area<=0:
@@ -584,8 +622,10 @@ class Vision:
             x,y,bw,bh=cv2.boundingRect(cnt)
             ratio=area/(w*h)
             aspect=bw/max(1.0,bh)
-            if not (min_ratio<=ratio<=max_ratio and .68<=aspect<=1.45):
+            if not (min_ratio<=ratio<=max_ratio and .58<=aspect<=1.65):
                 continue
+            box_area=max(1,bw*bh)
+            fill=area/box_area
             peri=cv2.arcLength(cnt,True)
             if peri<=0:
                 continue
@@ -593,19 +633,21 @@ class Vision:
             hull=cv2.convexHull(cnt)
             hull_area=cv2.contourArea(hull)
             solidity=area/hull_area if hull_area>0 else 1.0
-            # Spiky bomb: irregular outline. Purple pipes are much smoother/solid.
-            # Slightly relax only the tiny/far case so it is noticed earlier.
-            tiny=ratio<.006
-            circ_limit=.46 if tiny else .42
-            solidity_limit=.88 if tiny else .86
-            if circ<=circ_limit and solidity<=solidity_limit:
+
+            tiny=ratio<.0045
+            if tiny:
+                accepted=(fill>=.20 and circ<=.68 and solidity<=.95)
+            else:
+                accepted=(circ<=.50 and solidity<=.90)
+            if accepted:
                 cx=int(x+bw/2); cy=int(y+bh/2)
-                radius=int(max(bw,bh)*(.78 if tiny else .70))
+                radius=int(max(bw,bh)*(1.00 if tiny else .82))
                 found.append((cx,cy,radius))
         return tuple(found)
 
-    def detect(self, frame):
-        hsv=self._hsv(frame)
+    def detect(self, frame, hsv=None, hazards_hint=None):
+        if hsv is None:
+            hsv=self._hsv(frame)
         h,w=frame.shape[:2]
         V=hsv[:,:,2]
         dark=float(np.mean(V<70))
@@ -619,7 +661,8 @@ class Vision:
             return Detection("WIN_MACHINE", .98, popup_close=close)
 
         if self._gameplay_hud(hsv):
-            return Detection("PLAYING", .99, hazards=self.hazards(frame,hsv=hsv))
+            hazards=hazards_hint if hazards_hint is not None else self.hazards(frame,hsv=hsv)
+            return Detection("PLAYING", .99, hazards=hazards)
 
         blue_popup,popup_close=self._large_blue_popup(hsv)
         if blue_popup:
@@ -1170,8 +1213,23 @@ class SeaExplorerBot:
             while True:
                 self._check_stop()
                 frame=self._frame()
-                det=self.vision.detect(frame)
                 now=time.monotonic()
+
+                # If the previous frame was gameplay, run bomb vision FIRST and
+                # update the movement worker before doing the rest of state
+                # recognition. This cuts reaction latency without changing the
+                # user's swipe speed/distance settings.
+                prestepped=False
+                pre_reason=None
+                pre_target=None
+                if self.prev_state=="PLAYING":
+                    hsv=self.vision._hsv(frame)
+                    quick_hazards=self.vision.hazards(frame,hsv=hsv)
+                    pre_reason,pre_target=self.sweeper.step(frame,quick_hazards,self.dry_run)
+                    prestepped=True
+                    det=self.vision.detect(frame,hsv=hsv,hazards_hint=quick_hazards)
+                else:
+                    det=self.vision.detect(frame)
 
                 # One unreadable gameplay frame must not lift and restart the
                 # finger. The next local mirror frame arrives quickly.
@@ -1199,7 +1257,10 @@ class SeaExplorerBot:
                     self.prev_state=det.state
 
                 if det.state=="PLAYING":
-                    reason,target=self.sweeper.step(frame,det.hazards,self.dry_run)
+                    if prestepped:
+                        reason,target=pre_reason,pre_target
+                    else:
+                        reason,target=self.sweeper.step(frame,det.hazards,self.dry_run)
                     if now-last_status>=1.0:
                         log(f"{reason} target={target} hazards={len(det.hazards)}")
                         last_status=now
