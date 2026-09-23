@@ -3,8 +3,8 @@ SEA EXPLORER BOT — one-folder build
 
 WHAT IT DOES
 ------------
-- Uses ADB for menus and one initial gameplay frame, then captures the visible
-  scrcpy mirror locally for fast bomb checks and continuous touch control.
+- Uses ADB directly for menus, gameplay screenshots, and touchscreen swipes.
+  No scrcpy mirror is required for normal operation.
 - Does NOT try to recognize every treasure.
 - Holds one touch down and sweeps it left/right across the playable area.
 - Detects the spiky purple zombie/puffer hazard before each crossing, parks at
@@ -39,16 +39,13 @@ GETTING STARTED WITH THE WINDOW
 -------------------------------
 1. Install Python 3.11+ and the packages in requirements.txt:
        pip install -r requirements.txt
-2. Install Android platform-tools (adb) and scrcpy. The window can be opened
-   while the phone is disconnected; set executable paths in Settings if needed.
+2. Install Android platform-tools (adb). scrcpy is NOT required in ADB Direct mode.
 3. Double-click run_bot.bat to open the Sea Explorer dashboard.
 4. Choose USB or Wireless, connect to the phone, and open Sea Explorer on it.
-5. Press Start. The dashboard launches a scrcpy mirror for the selected phone.
-   Leave that mirror visible and unobstructed while the bot plays. The touch
-   driver uses the Windows pointer in the mirror, so focusing another window
-   during a held sweep stops the bot safely.
-   On smaller screens, use the Connection & dive / Checkpoints tabs. A Stop
-   button remains visible at the top while a dive is running.
+5. Press Start. The dashboard controls the selected phone directly through ADB.
+   No mirror window needs to appear or stay focused. On smaller screens, use the
+   Connection & dive / Checkpoints tabs. A Stop button remains visible at the
+   top while a dive is running.
 
 The Sea Explorer Bot desktop shortcut opens the dashboard and automatically
 starts the bot on the last selected USB or Wireless device. With one authorized
@@ -101,11 +98,10 @@ confirmed purchases.
 
 SAFETY / TEST MODE
 ------------------
-For command-line use without the dashboard, open an unobstructed scrcpy mirror
-yourself and run sea_explorer_bot.py. With multiple ADB devices, select exactly
-one using --serial; --window-title must match that mirror's title. The
---transport wireless option avoids the USB stay-awake command. For example:
-    python sea_explorer_bot.py --serial 192.0.2.10:5555 --transport wireless --window-title "Sea Explorer Mirror"
+For command-line use without the dashboard, run sea_explorer_bot.py directly.
+With multiple ADB devices, select exactly one using --serial. The --transport
+wireless option avoids the USB stay-awake command. For example:
+    python sea_explorer_bot.py --serial 192.0.2.10:5555 --transport wireless
 
 To watch detection without any taps/movement:
     python sea_explorer_bot.py --dry-run
@@ -124,14 +120,16 @@ important visual problem is avoiding the dangerous purple spiky enemy.
 
 The manual recording's pointer overlay stays at P:1/1 while moving from one
 edge to the other. It sweeps a narrow band around 65-70% of screen height.
-The prior controller sent many separate Android shell `motionevent` commands
-and planned two passes before looking again. On the phone that took several
-seconds, producing a slow oscillation and stale bomb decisions. The controller
-now holds one scrcpy touch, moves across 5-95% of the width in about 250 ms,
-and captures the scrcpy video before each return pass. Its normal height stays
-at 67% of the screen. Bombs descend quickly from above, so one approaching
-that band pauses the sweep at a safe edge; a short vertical escape is reserved
-for a close threat. Two clear frames are required before sweeping resumes.
+The controller uses real Android `input touchscreen swipe` gestures through
+ADB. Its normal height stays at 67% of the screen. Before every crossing it
+takes an ADB screenshot and checks for the purple hazard; an approaching hazard
+parks the sweep at a safe edge, while a short vertical escape is reserved for
+a close threat. Two clear frames are required before sweeping resumes.
+
+ADB Direct removes the mirror/focus failure mode and is simpler to run. A
+scrcpy video/control stream can have lower latency than repeated ADB screenshots
+and shell commands, so the legacy scrcpy modules are intentionally kept in the
+repository for future optional high-speed work.
 
 FILES
 -----
@@ -139,8 +137,8 @@ sea_explorer_bot.py   main program
 sea_explorer_ui.py    dashboard with connection, progress, and checkpoints
 connection_manager.py USB/wireless ADB connection helpers
 checkpoint_state.py   milestone definitions and saved marks
-scrcpy_touch.py       continuous Windows touch driver for scrcpy
-scrcpy_capture.py     fast local video capture from scrcpy
+scrcpy_touch.py       legacy optional scrcpy touch driver (not used by default)
+scrcpy_capture.py     legacy optional scrcpy capture (not used by default)
 config.json           goal, economy policy, coordinates, timing
 run_bot.bat           one-click dashboard launcher
 dry_run.bat           no-touch detector test

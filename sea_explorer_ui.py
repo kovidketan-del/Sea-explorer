@@ -30,7 +30,6 @@ from sea_explorer_bot import (
     log,
     SeaExplorerBot,
 )
-from scrcpy_touch import ScrcpyTouch, TouchUnavailable
 
 
 SETTINGS_PATH = ROOT / "ui_settings.json"
@@ -618,10 +617,10 @@ class SeaExplorerWindow:
                     widget.configure(state="disabled" if self.running or self.busy or self.closing else "normal")
         if self.running:
             self.connection_pill.configure(text="●  LIVE" if self.compact else "●  RUNNING", fg=COLORS["aqua"])
-            self.run_summary.configure(text="Keep the scrcpy mirror visible and in front. Clicking this window while the finger is held safely stops control.")
+            self.run_summary.configure(text="ADB Direct mode is running. No scrcpy mirror is required.")
         elif usable:
             self.connection_pill.configure(text=f"●  {self.connected_mode.upper()}" if self.compact else f"●  {self.connected_mode.upper()} READY", fg=COLORS["aqua"])
-            self.run_summary.configure(text=f"Ready on {self.connected_serial}. Start opens a dedicated scrcpy mirror.")
+            self.run_summary.configure(text=f"Ready on {self.connected_serial}. Start controls the phone directly through ADB.")
         elif self.connected_serial:
             self.connection_pill.configure(text="●  OFFLINE" if self.compact else "●  SELECTED MODE NOT CONNECTED", fg=COLORS["gold"])
             self.run_summary.configure(text="Connect a device in the selected mode to begin.")
@@ -792,10 +791,10 @@ class SeaExplorerWindow:
         panel = tk.Frame(dialog, bg=COLORS["bg"], padx=22, pady=20)
         panel.pack(fill="both", expand=True)
         self._label(panel, "Tool locations", size=16, weight="bold").pack(anchor="w")
-        self._label(panel, "Leave blank to search standard install locations.", size=9, color="muted").pack(anchor="w", pady=(3, 15))
+        self._label(panel, "ADB is required. scrcpy is kept only for legacy builds and is not used by ADB Direct mode.", size=9, color="muted").pack(anchor="w", pady=(3, 15))
         adb_var = tk.StringVar(value=str(self.settings.get("adb_path", "")))
         scrcpy_var = tk.StringVar(value=str(self.settings.get("scrcpy_path", "")))
-        for caption, variable in (("ADB EXECUTABLE", adb_var), ("SCRCPY EXECUTABLE", scrcpy_var)):
+        for caption, variable in (("ADB EXECUTABLE", adb_var), ("SCRCPY EXECUTABLE (LEGACY / OPTIONAL)", scrcpy_var)):
             self._label(panel, caption, size=8, color="muted", weight="bold").pack(anchor="w", pady=(0, 5))
             row = tk.Frame(panel, bg=COLORS["bg"])
             row.pack(fill="x", pady=(0, 11))
@@ -832,7 +831,6 @@ class SeaExplorerWindow:
             self._set_status("Reconnect the selected device before starting.", error=True)
             return
         try:
-            scrcpy = _find_scrcpy(str(self.settings.get("scrcpy_path", "")))
             config = load_config()
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             self._set_status(str(exc), error=True)
@@ -840,66 +838,25 @@ class SeaExplorerWindow:
         serial = self.connected_serial
         mode = self.connected_mode
         config["adb_path"] = str(self.settings.get("adb_path") or config.get("adb_path", ""))
-        title = f"Sea Explorer Mirror [{serial}]"
-        placement = self._mirror_position()
         self.stop_event = threading.Event()
         self.running = True
         self._update_controls()
-        self._set_status("Starting a dedicated scrcpy mirror…")
+        self._set_status("Starting ADB Direct control…")
         self.worker = threading.Thread(
             target=self._bot_worker,
-            args=(config, serial, mode, title, scrcpy, placement, self.stop_event),
+            args=(config, serial, mode, self.stop_event),
             daemon=True,
         )
         self.worker.start()
 
-    def _mirror_position(self):
-        self.root.update_idletasks()
-        desired_width = self.mirror_width
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-        right_edge = self.root.winfo_rootx() + self.root.winfo_width()
-        x = right_edge + 12
-        if x + desired_width > screen_width:
-            x = max(0, screen_width - desired_width - 20)
-        return x, 30, desired_width, min(760, max(400, screen_height - 70))
-
-    def _bot_worker(self, config, serial, mode, title, scrcpy, placement, stop_event):
-        proc: subprocess.Popen | None = None
+    def _bot_worker(self, config, serial, mode, stop_event):
         outcome = "Dive ended."
         try:
-            x, y, width, height = placement
-            command = [
-                scrcpy,
-                "--serial", serial,
-                "--window-title", title,
-                "--no-audio",
-                "--window-x", str(x),
-                "--window-y", str(y),
-                "--window-width", str(width),
-                "--window-height", str(height),
-            ]
-            proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            touch = ScrcpyTouch(title)
-            deadline = time.monotonic() + 12
-            while time.monotonic() < deadline:
-                if stop_event.is_set():
-                    raise StopRequested("Stopped while opening mirror")
-                if proc.poll() is not None:
-                    raise RuntimeError("scrcpy exited before its mirror opened. Check the device connection.")
-                try:
-                    touch._window()
-                    break
-                except TouchUnavailable:
-                    stop_event.wait(0.12)
-            else:
-                raise RuntimeError("scrcpy mirror did not appear within 12 seconds.")
             self.events.put(("bot_started",))
             SeaExplorerBot(
                 config,
                 serial=serial,
                 transport=mode,
-                window_title=title,
                 stop_event=stop_event,
             ).run()
         except StopRequested:
@@ -911,19 +868,8 @@ class SeaExplorerWindow:
                 log(f"ERROR {type(exc).__name__}: {exc}")
                 outcome = f"Bot stopped: {exc}"
         finally:
-            try:
-                if proc is not None and proc.poll() is None:
-                    try:
-                        proc.terminate()
-                        proc.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait(timeout=3)
-            except OSError as exc:
-                outcome = f"Bot stopped; could not close mirror: {exc}"
-            finally:
-                stop_event.set()
-                self.events.put(("bot_done", outcome))
+            stop_event.set()
+            self.events.put(("bot_done", outcome))
 
     def _stop_bot(self):
         if self.stop_event is not None:
@@ -954,7 +900,7 @@ class SeaExplorerWindow:
                     self._set_status(event[1], error=True)
                     self._update_controls()
                 elif event[0] == "bot_started":
-                    self._set_status("Dive running. Keep the mirror in front and unobstructed.")
+                    self._set_status("Dive running in ADB Direct mode.")
                 elif event[0] == "bot_done":
                     self.running = False
                     self.worker = None

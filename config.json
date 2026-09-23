@@ -40,7 +40,7 @@
     "x_left": 0.05,
     "x_right": 0.95,
     "danger_radius_ratio": 0.12,
-    "danger_ahead_ratio": 0.40,
+    "danger_ahead_ratio": 0.4,
     "danger_behind_ratio": 0.12,
     "gesture_lookahead_ratio": 0.06,
     "sweep_ms": 250,
@@ -82,5 +82,7 @@
     "unknown_relaunch_after_s": 28,
     "start_verify_timeout_s": 1.8,
     "start_retry_cooldown_s": 2
-  }
+  },
+  "control_backend": "adb_direct",
+  "capture_backend": "adb_screencap"
 }

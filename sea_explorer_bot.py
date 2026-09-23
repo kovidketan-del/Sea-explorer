@@ -14,12 +14,10 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from scrcpy_touch import ScrcpyTouch
-from scrcpy_capture import ScrcpyCapture
 
 
 ROOT = Path(__file__).resolve().parent
-BUILD = "scrcpy-sweep-7"
+BUILD = "adb-direct-1"
 CONFIG_PATH = ROOT / "config.json"
 STATE_PATH = ROOT / "progress_state.json"
 LOG_PATH = ROOT / "sea_explorer.log"
@@ -149,6 +147,13 @@ class ADB:
     def tap(self, x, y):
         self.run("shell", "input", "tap", int(x), int(y))
 
+    def swipe(self, x1, y1, x2, y2, duration_ms=180):
+        """Send one real Android touchscreen swipe directly through ADB."""
+        self.run(
+            "shell", "input", "touchscreen", "swipe",
+            int(x1), int(y1), int(x2), int(y2), int(duration_ms),
+        )
+
     def back(self):
         self.run("shell", "input", "keyevent", "BACK")
 
@@ -178,6 +183,34 @@ class ADB:
 
     def keep_awake_usb(self):
         self.run("shell","svc","power","stayon","usb",check=False)
+
+
+class ADBTouch:
+    """ScrcpyTouch-compatible adapter backed only by Android ADB input."""
+
+    def __init__(self, adb: ADB):
+        self.adb=adb
+        self.position: tuple[int,int] | None=None
+        self.active=False
+
+    def begin(self, x, y, w, h):
+        self.position=(int(x),int(y))
+        self.active=True
+
+    def move_to(self, x, y, duration_ms, w, h):
+        target=(int(x),int(y))
+        if self.position is None:
+            self.position=target
+            self.active=True
+            return
+        start=self.position
+        self.adb.swipe(start[0],start[1],target[0],target[1],duration_ms)
+        self.position=target
+        self.active=True
+
+    def release(self):
+        self.position=None
+        self.active=False
 
 
 @dataclass
@@ -471,7 +504,7 @@ class Vision:
 class Sweeper:
     """One fast observed pass at a time, with a held touch and bomb parking."""
 
-    def __init__(self, touch: ScrcpyTouch, cfg: dict):
+    def __init__(self, touch: ADBTouch, cfg: dict):
         self.touch=touch
         self.cfg=cfg
         self.last_target=None
@@ -615,10 +648,8 @@ class SeaExplorerBot:
             self.adb.keep_awake_usb()
         self.vision=Vision(cfg)
         self.progress=Progress.load(int(cfg["starting_oxygen_level"]))
-        title=window_title or cfg["motion"].get("scrcpy_window_title","RMX3853")
-        self.sweeper=Sweeper(None if dry_run else ScrcpyTouch(title),cfg)
-        self.capture_title=title
-        self.capture=None
+        # window_title is accepted only for backward CLI compatibility.
+        self.sweeper=Sweeper(None if dry_run else ADBTouch(self.adb),cfg)
         self.prev_state=None
         self.playing_unknown_since=None
         self.home_handled=False
@@ -639,8 +670,6 @@ class SeaExplorerBot:
 
     def _frame(self):
         self._check_stop()
-        if self.capture is not None and self.sweeper.active:
-            return self.capture.capture()
         return self.adb.screenshot()
 
     def _tap_norm(self, frame, pair):
@@ -883,9 +912,6 @@ class SeaExplorerBot:
 
                 if det.state=="PLAYING":
                     reason,target=self.sweeper.step(frame,det.hazards,self.dry_run)
-                    if not self.dry_run and self.capture is None:
-                        self.capture=ScrcpyCapture(
-                            self.capture_title,(frame.shape[1],frame.shape[0]))
                     if now-last_status>=1.0:
                         log(f"{reason} target={target} hazards={len(det.hazards)}")
                         last_status=now
@@ -920,13 +946,11 @@ class SeaExplorerBot:
             try:
                 self.sweeper.stop()
             finally:
-                if self.capture is not None:
-                    self.capture.close()
                 self.progress.save()
                 if self.sweeper.release_failed:
-                    log("STOP; touch release failed; progress saved.")
+                    log("STOP; ADB controller cleanup failed; progress saved.")
                 else:
-                    log("STOP; touch released and progress saved.")
+                    log("STOP; ADB direct controller stopped; progress saved.")
 
 
 def analyze_video(path, cfg, every_s=1.0):
@@ -970,7 +994,7 @@ def main():
     p.add_argument("--sample-every",type=float,default=1.0,help="seconds between offline video samples")
     p.add_argument("--serial",help="exact authorized ADB serial to control")
     p.add_argument("--transport",choices=("usb","wireless"),help="selected connection transport")
-    p.add_argument("--window-title",help="exact scrcpy window title for touch and video")
+    p.add_argument("--window-title",help="legacy option; ignored in ADB direct mode")
     args=p.parse_args()
 
     cfg=load_config()
