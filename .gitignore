@@ -5,3 +5,4 @@ progress_state.json
 checkpoint_state.json
 ui_settings.json
 *.tmp
+captures/

@@ -72,10 +72,10 @@ def _runtime_motion_values(config: dict, settings: dict) -> tuple[int, float, fl
     """Resolve persisted UI motion controls with safe fallbacks."""
     motion=config.get("motion",{})
     try:
-        speed=int(settings.get("sweep_ms",motion.get("sweep_ms",110)))
+        speed=int(settings.get("sweep_ms",motion.get("sweep_ms",600)))
     except (TypeError,ValueError):
-        speed=int(motion.get("sweep_ms",110))
-    speed=max(10,min(1000,speed))
+        speed=int(motion.get("sweep_ms",600))
+    speed=max(420,min(1000,speed))
 
     try:
         left=float(settings.get("swipe_left_percent",float(motion.get("x_left",.05))*100))
@@ -654,7 +654,7 @@ class SeaExplorerWindow:
                     widget.configure(state="disabled" if self.running or self.busy or self.closing else "normal")
         if self.running:
             self.connection_pill.configure(text="●  LIVE" if self.compact else "●  RUNNING", fg=COLORS["aqua"])
-            self.run_summary.configure(text="ADB Direct mode is running. No scrcpy mirror is required.")
+            self.run_summary.configure(text="Headless video and target-guided held touch are running; laptop windows remain free.")
         elif usable:
             self.connection_pill.configure(text=f"●  {self.connected_mode.upper()}" if self.compact else f"●  {self.connected_mode.upper()} READY", fg=COLORS["aqua"])
             self.run_summary.configure(text=f"Ready on {self.connected_serial}. Start controls the phone directly through ADB.")
@@ -846,7 +846,7 @@ class SeaExplorerWindow:
         try:
             base_cfg=load_config()
         except Exception:
-            base_cfg={"motion":{"sweep_ms":110,"x_left":.05,"x_right":.95}}
+            base_cfg={"motion":{"sweep_ms":600,"x_left":.05,"x_right":.95}}
         speed,left_norm,right_norm=_runtime_motion_values(base_cfg,self.settings)
         speed_var=tk.StringVar(value=str(speed))
         left_var=tk.StringVar(value=f"{left_norm*100:.0f}")
@@ -858,7 +858,7 @@ class SeaExplorerWindow:
         motion_row.grid_columnconfigure((0,1,2),weight=1,uniform="motion")
 
         fields=(
-            ("SWIPE TIME (MS)",speed_var),
+            ("CROSS-SCREEN TIME (MS)",speed_var),
             ("LEFT EDGE (%)",left_var),
             ("RIGHT EDGE (%)",right_var),
         )
@@ -870,8 +870,8 @@ class SeaExplorerWindow:
 
         self._label(
             panel,
-            "Lower ms = faster.  Current default is 110 ms.  Swipe area is the horizontal range; "
-            "5% → 95% means almost the full screen. Try 15% → 85% or 20% → 80% for shorter swipes.",
+            "Held-touch travel time across the play area; lower is faster, minimum 420 ms. "
+            "The bot now follows safe loot instead of sweeping between edges.",
             size=8,color="muted",wraplength=565,justify="left"
         ).pack(anchor="w",pady=(2,13))
 
@@ -934,8 +934,8 @@ class SeaExplorerWindow:
             except ValueError:
                 self._set_status("Motion settings must be numbers.", error=True)
                 return
-            if not 10<=speed_value<=1000:
-                self._set_status("Swipe time must be between 10 and 1000 ms.", error=True)
+            if not 420<=speed_value<=1000:
+                self._set_status("Cross-screen time must be between 420 and 1000 ms.", error=True)
                 return
             if not 2<=left_value<=49 or not 51<=right_value<=98:
                 self._set_status("Swipe edges must stay within 2–49% left and 51–98% right.", error=True)
@@ -1000,6 +1000,7 @@ class SeaExplorerWindow:
         serial = self.connected_serial
         mode = self.connected_mode
         config["adb_path"] = str(self.settings.get("adb_path") or config.get("adb_path", ""))
+        config["scrcpy_path"] = str(self.settings.get("scrcpy_path") or config.get("scrcpy_path", ""))
         _apply_runtime_settings(config,self.settings)
         motion=config["motion"]
         log(
@@ -1009,7 +1010,7 @@ class SeaExplorerWindow:
         self.stop_event = threading.Event()
         self.running = True
         self._update_controls()
-        self._set_status("Starting ADB Direct control…")
+        self._set_status("Starting target-guided held-touch control…")
         self.worker = threading.Thread(
             target=self._bot_worker,
             args=(config, serial, mode, self.stop_event),

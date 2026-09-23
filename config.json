@@ -43,7 +43,7 @@
     "danger_ahead_ratio": 0.58,
     "danger_behind_ratio": 0.12,
     "gesture_lookahead_ratio": 0.06,
-    "sweep_ms": 110,
+    "sweep_ms": 600,
     "escape_ms": 120,
     "clear_frames": 2,
     "control_y": 0.67,
@@ -88,8 +88,11 @@
     "start_verify_timeout_s": 1.8,
     "start_retry_cooldown_s": 2
   },
-  "control_backend": "adb_direct",
-  "capture_backend": "adb_screencap",
+  "control_backend": "scrcpy_stream",
+  "capture_backend": "scrcpy_stream",
+  "stream_codec": "h264",
+  "stream_max_size": 720,
+  "stream_max_fps": 60,
   "economy_ocr": {
     "digit_confidence_min": 0.82,
     "coins_roi": [

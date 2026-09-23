@@ -34,7 +34,7 @@ class DeviceBindingTests(unittest.TestCase):
                 adb.ensure_ready(serial)
             self.assertIsNone(adb.serial)
 
-    @patch("sea_explorer_bot.Sweeper")
+    @patch("sea_explorer_bot.TargetController")
     @patch("sea_explorer_bot.Progress.load")
     @patch("sea_explorer_bot.Vision")
     @patch("sea_explorer_bot.ADB")

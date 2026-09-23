@@ -3,12 +3,12 @@ SEA EXPLORER BOT — one-folder build
 
 WHAT IT DOES
 ------------
-- Uses ADB directly for menus, gameplay screenshots, and touchscreen swipes.
-  No scrcpy mirror is required for normal operation.
-- Does NOT try to recognize every treasure.
-- Holds one touch down and sweeps it left/right across the playable area.
-- Detects the spiky purple zombie/puffer hazard before each crossing, parks at
-  a safe edge while it passes, and uses a short escape only if already close.
+- Uses a headless scrcpy 4.1 H.264 stream decoded in PC memory. No scrcpy
+  desktop window, window capture, foreground focus, or screen-coordinate mouse
+  control is needed. ADB is still used to launch the server and tap menus.
+- Detects gold collectibles and prioritizes a safe target over blind sweeping.
+- Holds one finger continuously via scrcpy's control socket and steers smoothly.
+- Detects purple hazards ahead of the diver and gives escape priority over loot.
 - Rejects the red coral that previously caused false bomb evades.
 - Claims the normal end-of-run reward.
 - Closes the optional purple Win Machine instead of pressing SPIN/ad.
@@ -39,7 +39,10 @@ GETTING STARTED WITH THE WINDOW
 -------------------------------
 1. Install Python 3.11+ and the packages in requirements.txt:
        pip install -r requirements.txt
-2. Install Android platform-tools (adb). scrcpy is NOT required in ADB Direct mode.
+2. Install Android platform-tools (adb) and the official scrcpy 4.1 Windows bundle.
+   Keep scrcpy.exe and scrcpy-server together. Set scrcpy_path in config.json
+   if the bundle is not in Downloads or PATH. The headless path uses its server
+   only; it does not launch scrcpy.exe or create a mirror window.
 3. Double-click run_bot.bat to open the Sea Explorer dashboard.
 4. Choose USB or Wireless, connect to the phone, and open Sea Explorer on it.
 5. Press Start. The dashboard controls the selected phone directly through ADB.
@@ -111,25 +114,24 @@ Offline test against a recording:
 
 Ctrl+C safely releases the held virtual touch and writes progress.
 
-WHY FAST SWEEP INSTEAD OF ITEM RECOGNITION?
--------------------------------------------
-The user's idea is sound for this game: if the diver follows a held drag and
-collectibles are acquired by contact, recognizing every item is unnecessary.
-A dense sweep covers the screen regardless of treasure artwork. The only
-important visual problem is avoiding the dangerous purple spiky enemy.
+HEADLESS CAPTURE AND CONTROL
+----------------------------
+Normal pipeline: Android MediaCodec -> scrcpy 4.1 server -> ADB-forwarded H.264
+packets -> PyAV decode -> OpenCV BGR frame -> hazard/item vision -> target planner
+-> scrcpy control socket. Only the newest decoded frame is retained. Gameplay
+touches are held across movements, with small interpolated moves and a release
+on stop or stale stream. Menus still use occasional ADB taps.
 
-The manual recording's pointer overlay stays at P:1/1 while moving from one
-edge to the other. It sweeps a narrow band around 65-70% of screen height.
-The controller uses real Android `input touchscreen swipe` gestures through
-ADB. Its normal height stays at 67% of the screen. Before every crossing it
-takes an ADB screenshot and checks for the purple hazard; an approaching hazard
-parks the sweep at a safe edge, while a short vertical escape is reserved for
-a close threat. Two clear frames are required before sweeping resumes.
+Normal config is capture_backend/control_backend = scrcpy_stream. For optional
+troubleshooting with a visible preview, use scrcpy_window for both settings;
+that older path requires the mirror to stay unobstructed and focused. The
+adb_direct fallback is slower but needs no scrcpy installation. Pointer Location
+and Show Taps can be enabled on Android to inspect the actual held touch.
 
-ADB Direct removes the mirror/focus failure mode and is simpler to run. A
-scrcpy video/control stream can have lower latency than repeated ADB screenshots
-and shell commands, so the legacy scrcpy modules are intentionally kept in the
-repository for future optional high-speed work.
+The chosen H.264 codec and 720px max dimension reflect measured throughput on
+the connected OPPO phone. A claimed 10-40 ms *end-to-end* latency was not
+verified; see docs/headless_capture_benchmark.md for what was measured and the
+remaining latency boundaries.
 
 FILES
 -----
@@ -137,8 +139,11 @@ sea_explorer_bot.py   main program
 sea_explorer_ui.py    dashboard with connection, progress, and checkpoints
 connection_manager.py USB/wireless ADB connection helpers
 checkpoint_state.py   milestone definitions and saved marks
-scrcpy_touch.py       legacy optional scrcpy touch driver (not used by default)
-scrcpy_capture.py     legacy optional scrcpy capture (not used by default)
+headless_scrcpy.py    default video/control socket transport (no desktop window)
+scrcpy_binary.py      locate the matching scrcpy 4.1 server bundle
+scrcpy_runtime.py     optional visible mirror for troubleshooting
+scrcpy_touch.py       optional visible-mirror touch driver
+scrcpy_capture.py     optional visible-mirror capture
 config.json           goal, economy policy, coordinates, timing
 run_bot.bat           one-click dashboard launcher
 dry_run.bat           no-touch detector test

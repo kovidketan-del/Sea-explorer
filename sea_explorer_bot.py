@@ -17,6 +17,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from target_control import TargetController
+
 
 ROOT = Path(__file__).resolve().parent
 BUILD = "adb-direct-smart-economy-3"
@@ -166,7 +168,7 @@ class ADB:
             w,h,pixel_format=struct.unpack_from("<III",raw,0)
         except struct.error:
             return None
-        if not (16<=w<=10000 and 16<=h<=10000):
+        if not (1<=w<=10000 and 1<=h<=10000):
             return None
         pixels=w*h
         # Android versions use either a 12-byte header or a 16-byte header
@@ -240,12 +242,20 @@ class ADB:
     def start_app(self, package):
         self.run("shell","monkey","-p",package,"-c","android.intent.category.LAUNCHER","1", check=False)
 
+    def is_keyguard_locked(self):
+        """Avoid mistaking the Android lock screen for an in-game transition."""
+        policy=self.run("shell","dumpsys","window","policy",timeout=5)
+        match=re.search(r"KeyguardStateMonitor\s+mIsShowing=(true|false)",policy)
+        return match is not None and match.group(1)=="true"
+
     def keep_awake_usb(self):
         self.run("shell","svc","power","stayon","usb",check=False)
 
 
 class ADBTouch:
-    """ScrcpyTouch-compatible adapter backed only by Android ADB input."""
+    """One held Android pointer, not a sequence of released ``input swipe`` calls."""
+
+    low_rate = True
 
     def __init__(self, adb: ADB):
         self.adb=adb
@@ -253,23 +263,27 @@ class ADBTouch:
         self.active=False
 
     def begin(self, x, y, w, h):
+        if self.active:
+            raise BotError("ADB touch is already held")
+        self.adb.run("shell", "input", "touchscreen", "motionevent", "DOWN", int(x), int(y), timeout=3)
         self.position=(int(x),int(y))
         self.active=True
 
     def move_to(self, x, y, duration_ms, w, h):
         target=(int(x),int(y))
-        if self.position is None:
-            self.position=target
-            self.active=True
-            return
-        start=self.position
-        self.adb.swipe(start[0],start[1],target[0],target[1],duration_ms)
+        if not self.active or self.position is None:
+            raise BotError("ADB touch is not held")
+        self.adb.run("shell", "input", "touchscreen", "motionevent", "MOVE", *target, timeout=3)
         self.position=target
-        self.active=True
 
     def release(self):
-        self.position=None
-        self.active=False
+        position=self.position
+        try:
+            if self.active and position is not None:
+                self.adb.run("shell", "input", "touchscreen", "motionevent", "UP", *position, timeout=3)
+        finally:
+            self.position=None
+            self.active=False
 
 
 @dataclass
@@ -379,7 +393,19 @@ class Vision:
                 continue
             if cx/w < .38: left=True
             if cx/w > .62: right=True
-        return left and right
+        if left and right:
+            return True
+        # A falling gold/coral object can merge with one HUD into a component
+        # larger than the expected box.  The fixed top/bottom orange rim still
+        # remains visible; recognize that geometry independently of connected
+        # component size.  Require the rims on BOTH sides to avoid HOME.
+        rim=self._color_mask(hsv,3,28,100,80)
+        for x1,x2 in ((.03,.36),(.64,.97)):
+            top=rim[int(.115*h):int(.122*h),int(x1*w):int(x2*w)]
+            bottom=rim[int(.158*h):int(.163*h),int(x1*w):int(x2*w)]
+            if top.size==0 or bottom.size==0 or float(top.mean())<.55 or float(bottom.mean())<.55:
+                return False
+        return True
 
     def _home(self, hsv):
         h,w=hsv.shape[:2]
@@ -643,6 +669,30 @@ class Vision:
                 cx=int(x+bw/2); cy=int(y+bh/2)
                 radius=int(max(bw,bh)*(1.00 if tiny else .82))
                 found.append((cx,cy,radius))
+        return tuple(found)
+
+    def collectibles(self, frame, hsv=None):
+        """Find warm gold loot above the diver, excluding HUD and held bag art.
+
+        The background is cyan, while coins, vases and treasure in the supplied
+        recording share a saturated orange/gold core.  Return screen positions
+        with object radii so steering can rank approaching objects.
+        """
+        if hsv is None:
+            hsv=self._hsv(frame)
+        h,w=hsv.shape[:2]
+        H,S,V=cv2.split(hsv)
+        mask=((H>=5)&(H<=34)&(S>=90)&(V>=80)).astype(np.uint8)
+        mask[:int(.17*h)]=0
+        mask[int(.655*h):]=0
+        minimum=max(90,int(w*h*.00035))
+        found=[]
+        for x,y,bw,bh,area,cx,cy in self._components(mask,minimum):
+            if not (.025<=bw/w<=.40 and .018<=bh/h<=.20):
+                continue
+            if area/max(1,bw*bh)<.18:
+                continue
+            found.append((int(cx),int(cy),int(max(bw,bh)*.5)))
         return tuple(found)
 
     def detect(self, frame, hsv=None, hazards_hint=None):
@@ -940,7 +990,19 @@ class SeaExplorerBot:
         self.vision=Vision(cfg)
         self.progress=Progress.load(int(cfg["starting_oxygen_level"]))
         # window_title is accepted only for backward CLI compatibility.
-        self.sweeper=Sweeper(None if dry_run else ADBTouch(self.adb),cfg)
+        backend=cfg.get("control_backend", "adb_direct")
+        if not dry_run and backend=="scrcpy_window":
+            from scrcpy_touch import ScrcpyTouch
+            from scrcpy_runtime import WINDOW_TITLE
+            touch=ScrcpyTouch(WINDOW_TITLE)
+        elif backend=="scrcpy_stream":
+            # The matching control socket becomes available after the headless
+            # video server starts in run().
+            touch=None
+        else:
+            touch=None if dry_run else ADBTouch(self.adb)
+        self.sweeper=TargetController(touch,cfg)
+        self.capture_runtime=None
         self.prev_state=None
         self.playing_unknown_since=None
         self.home_handled=False
@@ -961,16 +1023,29 @@ class SeaExplorerBot:
 
     def _frame(self):
         self._check_stop()
+        if self.capture_runtime is not None:
+            frame=self.capture_runtime.capture()
+            if (self.prev_state=="PLAYING" and
+                getattr(self.capture_runtime,"last_frame_age",0)>.45):
+                raise BotError("Gameplay video stream is stale; releasing held touch")
+            return frame
         return self.adb.screenshot()
+
+    def _tap_frame(self, frame, x, y):
+        h,w=frame.shape[:2]
+        native=getattr(self.capture_runtime,"device_size",None) or (w,h)
+        px=round(int(x)*native[0]/w)
+        py=round(int(y)*native[1]/h)
+        if self.dry_run:
+            log(f"DRY TAP ({px},{py})")
+        else:
+            self.adb.tap(px,py)
 
     def _tap_norm(self, frame, pair):
         self._check_stop()
         h,w=frame.shape[:2]
         x=int(float(pair[0])*w); y=int(float(pair[1])*h)
-        if self.dry_run:
-            log(f"DRY TAP ({x},{y})")
-        else:
-            self.adb.tap(x,y)
+        self._tap_frame(frame,x,y)
 
     def _resolve_package(self):
         if self.progress.package:
@@ -1001,7 +1076,7 @@ class SeaExplorerBot:
         if det.popup_close:
             x,y=det.popup_close
             if self.dry_run: log(f"DRY close popup ({x},{y})")
-            else: self.adb.tap(x,y)
+            else: self._tap_frame(frame,x,y)
         else:
             self._tap_norm(frame,self.cfg["taps"]["popup_close_fallback"])
 
@@ -1202,6 +1277,8 @@ class SeaExplorerBot:
             self.unknown_since=now
 
     def run(self):
+        if self.adb.is_keyguard_locked():
+            raise BotError("Android is locked. Unlock the phone and open Sea Explorer before starting the bot.")
         package=self._resolve_package()
         log(
             f"START package={package} dry_run={self.dry_run} "
@@ -1210,6 +1287,23 @@ class SeaExplorerBot:
         )
         last_status=0.0
         try:
+            if self.cfg.get("capture_backend")=="scrcpy_window":
+                from scrcpy_runtime import ScrcpyRuntime
+                self.capture_runtime=ScrcpyRuntime(self.adb,self.cfg.get("scrcpy_path",""))
+                self.capture_runtime.start()
+                log("Fast scrcpy mirror ready; one continuous held touch will control the diver.")
+            elif self.cfg.get("capture_backend")=="scrcpy_stream":
+                from headless_scrcpy import HeadlessScrcpy,ScrcpySocketTouch
+                self.capture_runtime=HeadlessScrcpy(
+                    self.adb,self.cfg.get("scrcpy_path",""),
+                    max_size=int(self.cfg.get("stream_max_size",720)),
+                    codec=self.cfg.get("stream_codec","h264"),
+                    max_fps=int(self.cfg.get("stream_max_fps",0)),
+                )
+                self.capture_runtime.start()
+                if not self.dry_run:
+                    self.sweeper.touch=ScrcpySocketTouch(self.capture_runtime)
+                log(f"Headless {self.capture_runtime.codec} stream ready at {self.capture_runtime.video_size}; no desktop window required.")
             while True:
                 self._check_stop()
                 frame=self._frame()
@@ -1225,7 +1319,8 @@ class SeaExplorerBot:
                 if self.prev_state=="PLAYING":
                     hsv=self.vision._hsv(frame)
                     quick_hazards=self.vision.hazards(frame,hsv=hsv)
-                    pre_reason,pre_target=self.sweeper.step(frame,quick_hazards,self.dry_run)
+                    quick_items=self.vision.collectibles(frame,hsv=hsv)
+                    pre_reason,pre_target=self.sweeper.step(frame,quick_hazards,self.dry_run,items=quick_items)
                     prestepped=True
                     det=self.vision.detect(frame,hsv=hsv,hazards_hint=quick_hazards)
                 else:
@@ -1260,9 +1355,10 @@ class SeaExplorerBot:
                     if prestepped:
                         reason,target=pre_reason,pre_target
                     else:
-                        reason,target=self.sweeper.step(frame,det.hazards,self.dry_run)
+                        items=self.vision.collectibles(frame)
+                        reason,target=self.sweeper.step(frame,det.hazards,self.dry_run,items=items)
                     if now-last_status>=1.0:
-                        log(f"{reason} target={target} hazards={len(det.hazards)}")
+                        log(f"{reason} touch={target} hazards={len(det.hazards)} items={len(quick_items) if prestepped else len(items)}")
                         last_status=now
                     self._sleep(float(self.cfg["timing"]["gameplay_loop_s"]))
                     continue
@@ -1275,7 +1371,7 @@ class SeaExplorerBot:
                     if det.orange_button:
                         log(f"Claiming run reward at {det.orange_button}")
                         if not self.dry_run:
-                            self.adb.tap(*det.orange_button)
+                            self._tap_frame(frame,*det.orange_button)
                         self._sleep(float(self.cfg["timing"]["after_result_tap_s"]))
                 elif det.state=="WIN_MACHINE":
                     log("Closing optional Win Machine; never pressing SPIN/ad.")
@@ -1295,6 +1391,9 @@ class SeaExplorerBot:
             try:
                 self.sweeper.stop()
             finally:
+                if self.capture_runtime is not None:
+                    self.capture_runtime.close()
+                    self.capture_runtime=None
                 self.progress.save()
                 if self.sweeper.release_failed:
                     log("STOP; ADB controller cleanup failed; progress saved.")

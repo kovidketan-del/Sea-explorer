@@ -4,80 +4,81 @@ import unittest
 
 import numpy as np
 
-from sea_explorer_bot import Sweeper, load_config
+from target_control import TargetController
+from sea_explorer_bot import load_config
 
 
 class FakeTouch:
     def __init__(self):
-        self.actions=[]
-        self.active=False
-        self.lock=threading.Lock()
+        self.actions = []
+        self.active = False
+        self.lock = threading.Lock()
 
-    def begin(self,x,y,w,h):
+    def begin(self, x, y, w, h):
         with self.lock:
-            self.actions.append(("BEGIN",x,y))
-            self.active=True
+            self.actions.append(("DOWN", x, y))
+            self.active = True
 
-    def move_to(self,x,y,duration_ms,w,h):
+    def move_to(self, x, y, duration_ms, w, h):
         with self.lock:
-            self.actions.append(("MOVE",x,y,duration_ms))
-        time.sleep(0.002)
+            self.actions.append(("MOVE", x, y, duration_ms))
+        time.sleep(.001)
 
     def release(self):
         with self.lock:
-            self.actions.append(("RELEASE",))
-            self.active=False
+            if self.active:
+                self.actions.append(("UP",))
+            self.active = False
 
 
-class SweeperTests(unittest.TestCase):
+class TargetControlTests(unittest.TestCase):
     def setUp(self):
-        self.touch=FakeTouch()
-        self.cfg=load_config()
-        self.cfg["motion"]["sweep_ms"]=20
-        self.sweeper=Sweeper(self.touch,self.cfg)
-        self.frame=np.zeros((2400,1080,3),np.uint8)
+        self.touch = FakeTouch()
+        self.cfg = load_config()
+        self.controller = TargetController(self.touch, self.cfg)
+        self.frame = np.zeros((2400, 1080, 3), np.uint8)
 
     def tearDown(self):
-        if self.sweeper.active:
-            self.sweeper.stop()
+        self.controller.stop()
 
-    def _wait_for_moves(self,count,timeout=.5):
-        deadline=time.monotonic()+timeout
-        while time.monotonic()<deadline:
+    def test_no_item_does_not_sweep(self):
+        reason, _ = self.controller.step(self.frame, (), dry_run=True)
+        self.assertIn("DRY-HOLD", reason)
+        self.assertEqual(self.touch.actions, [])
+
+    def test_visible_item_is_targeted_without_hazard(self):
+        goal, mode, _ = self.controller._plan(1080, 2400, (), ((825, 1150, 70),), 540)
+        self.assertEqual((goal, mode), (825, "COLLECT"))
+
+    def test_virus_blocks_item_and_forces_early_escape(self):
+        hazard = ((540, 900, 170),)
+        goal, mode, _ = self.controller._plan(1080, 2400, hazard, ((540, 1050, 55),), 540)
+        self.assertEqual(mode, "EVADE")
+        self.assertGreater(abs(goal - 540), 170)
+        self.assertGreater(self.controller._clearance(goal, hazard, 1080), 0)
+
+    def test_survival_takes_precedence_over_visible_gold(self):
+        hazard = ((830, 950, 160),)
+        goal, mode, _ = self.controller._plan(1080, 2400, hazard, ((825, 1200, 60),), 540)
+        self.assertEqual((goal, mode), (540, "HOLD"))
+
+    def test_one_hold_moves_toward_target_without_alternating(self):
+        self.controller.step(self.frame, (), items=((860, 1100, 70),))
+        deadline = time.monotonic() + .6
+        moves = []
+        while time.monotonic() < deadline:
             with self.touch.lock:
-                moves=[x for x in self.touch.actions if x[0]=="MOVE"]
-            if len(moves)>=count:
-                return moves
+                moves = [a for a in self.touch.actions if a[0] == "MOVE"]
+            if len(moves) >= 4:
+                break
             time.sleep(.005)
-        return moves
-
-    def test_continues_left_right_without_waiting_for_more_vision_frames(self):
-        self.sweeper.step(self.frame,())
-        moves=self._wait_for_moves(6)
-        self.assertGreaterEqual(len(moves),6)
-        xs=[m[1] for m in moves[:6]]
-        self.assertEqual(xs,[1026,54,1026,54,1026,54])
-
-    def test_hazard_update_parks_worker_then_clear_frames_resume(self):
-        self.sweeper.step(self.frame,())
-        self.assertGreaterEqual(len(self._wait_for_moves(2)),2)
-        bomb=((540,1608,250),)
-        self.sweeper.step(self.frame,bomb)
-        time.sleep(.04)
-        with self.touch.lock:
-            before=len([x for x in self.touch.actions if x[0]=="MOVE"])
-        self.sweeper.step(self.frame,())
-        self.sweeper.step(self.frame,())
-        moves=self._wait_for_moves(before+2)
-        self.assertGreaterEqual(len(moves),before+2)
-
-    def test_dry_run_never_starts_worker_or_injects_touch(self):
-        reason,_=self.sweeper.step(self.frame,(),dry_run=True)
-        self.assertIn("DRY-CONTINUOUS",reason)
-        time.sleep(.02)
-        self.assertEqual(self.touch.actions,[])
-        self.assertFalse(self.sweeper.active)
+        self.assertGreaterEqual(len(moves), 4)
+        self.assertEqual(self.touch.actions[0][0], "DOWN")
+        self.assertEqual([m[1] for m in moves[:4]], sorted(m[1] for m in moves[:4]))
+        self.assertEqual(self.controller.direction_changes, 0)
+        self.controller.stop()
+        self.assertEqual(sum(a[0] == "UP" for a in self.touch.actions), 1)
 
 
-if __name__=="__main__":
+if __name__ == "__main__":
     unittest.main()

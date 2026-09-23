@@ -22,7 +22,7 @@ class RuntimeMotionSettingsTests(unittest.TestCase):
             "upgrade_mode":"oxygen",
         }
         ui._apply_runtime_settings(config,settings)
-        self.assertEqual(config["motion"]["sweep_ms"],140)
+        self.assertEqual(config["motion"]["sweep_ms"],420)
         self.assertEqual(config["motion"]["x_left"],.20)
         self.assertEqual(config["motion"]["x_right"],.80)
         self.assertTrue(config["economy"]["buy_upgrades"])
@@ -32,7 +32,7 @@ class RuntimeMotionSettingsTests(unittest.TestCase):
         config={"motion":{"sweep_ms":110,"x_left":.05,"x_right":.95},"economy":{}}
         settings={"sweep_ms":"bad","swipe_left_percent":-50,"swipe_right_percent":150}
         ui._apply_runtime_settings(config,settings)
-        self.assertEqual(config["motion"]["sweep_ms"],110)
+        self.assertEqual(config["motion"]["sweep_ms"],420)
         self.assertEqual(config["motion"]["x_left"],.02)
         self.assertEqual(config["motion"]["x_right"],.98)
 

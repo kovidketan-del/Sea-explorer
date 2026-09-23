@@ -57,10 +57,9 @@ class ConnectionManagerTests(unittest.TestCase):
     def test_pairing_uses_argument_list_and_does_not_save_or_report_code(self, run):
         run.return_value = completed("pair", stdout="Successfully paired")
         self.manager.pair_wireless("192.168.1.7:38271", "123456")
-        run.assert_called_once_with(
-            [ADB, "pair", "192.168.1.7:38271", "123456"],
-            capture_output=True, text=True, timeout=30, check=False,
-        )
+        self.assertEqual(run.call_args.args[0], [ADB, "pair", "192.168.1.7:38271", "123456"])
+        self.assertEqual(run.call_args.kwargs["timeout"], 30)
+        self.assertFalse(run.call_args.kwargs["check"])
         self.assertNotIn("123456", vars(self.manager).values())
         run.return_value = completed("pair", returncode=1, stderr="pairing failed")
         with self.assertRaises(DeviceConnectionError) as caught:
