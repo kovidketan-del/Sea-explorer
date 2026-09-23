@@ -55,6 +55,12 @@ class RecordedGameplayTests(unittest.TestCase):
         self.assertEqual(frame.shape[:2],(720,324))
         self.assertEqual(self.vision.detect(frame).state,"HOME")
 
+    def test_gameplay_counters_still_detect_at_headless_stream_size(self):
+        for name in ("sea_48.jpg","sea_48_5.jpg","sea_56.jpg","sea_64.jpg"):
+            with self.subTest(frame=name):
+                frame=cv2.resize(self.frame(name),(324,720))
+                self.assertEqual(self.vision.detect(frame).state,"PLAYING")
+
 
 if __name__ == "__main__":
     unittest.main()
