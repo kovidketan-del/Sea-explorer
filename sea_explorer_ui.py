@@ -829,8 +829,8 @@ class SeaExplorerWindow:
 
         # Keep Save permanently visible even when Windows DPI/font scaling makes
         # the settings body taller than expected.
-        footer=tk.Frame(dialog,bg=COLORS["bg"],padx=22,pady=(8,16))
-        footer.pack(side="bottom",fill="x")
+        footer=tk.Frame(dialog,bg=COLORS["bg"],padx=22,pady=0)
+        footer.pack(side="bottom",fill="x",pady=(8,16))
 
         panel=tk.Frame(dialog,bg=COLORS["bg"],padx=22,pady=18)
         panel.pack(side="top",fill="both",expand=True)
