@@ -43,7 +43,7 @@
     "danger_ahead_ratio": 0.4,
     "danger_behind_ratio": 0.12,
     "gesture_lookahead_ratio": 0.06,
-    "sweep_ms": 110,
+    "sweep_ms": 80,
     "escape_ms": 120,
     "clear_frames": 2,
     "control_y": 0.67,
