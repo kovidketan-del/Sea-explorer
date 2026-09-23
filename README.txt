@@ -155,18 +155,3 @@ HOME detection was updated after the first real-phone run.
 The turquoise HOME background can merge with the SHOP button in HSV, so HOME
 now keys off the two isolated lower BAG SIZE + OXYGEN LEVEL purchase buttons.
 This fixes the observed `STATE - -> UNKNOWN` on the supplied live HOME frame.
-
-
-MAX-SPEED ADB DIRECT
---------------------
-The default movement backend now keeps one hidden persistent ADB shell open for
-gameplay swipes instead of launching adb.exe once per crossing. Normal movement
-uses 2%-98% of the phone width and a 20 ms swipe duration, alternating left and
-right continuously while vision runs independently.
-
-The user's phone/game was observed to use an Xv range of about -19 on the left
-and +20 on the right. Those are recorded in config.json as target_xv_left/right.
-ADB cannot directly write the game's internal Xv variable; the controller drives
-full-width, minimum-duration gestures to hit the game's horizontal velocity cap.
-A fresh purple-hazard detection interrupts the movement shell immediately before
-parking/escape logic takes over.

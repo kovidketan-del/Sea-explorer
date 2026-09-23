@@ -21,11 +21,7 @@ class FakeTouch:
     def move_to(self,x,y,duration_ms,w,h):
         with self.lock:
             self.actions.append(("MOVE",x,y,duration_ms))
-        time.sleep(0.001)
-
-    def interrupt(self):
-        with self.lock:
-            self.actions.append(("INTERRUPT",))
+        time.sleep(0.002)
 
     def release(self):
         with self.lock:
@@ -37,7 +33,7 @@ class SweeperTests(unittest.TestCase):
     def setUp(self):
         self.touch=FakeTouch()
         self.cfg=load_config()
-        self.cfg["motion"]["sweep_ms"]=5
+        self.cfg["motion"]["sweep_ms"]=20
         self.sweeper=Sweeper(self.touch,self.cfg)
         self.frame=np.zeros((2400,1080,3),np.uint8)
 
