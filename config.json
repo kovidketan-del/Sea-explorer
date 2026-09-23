@@ -40,15 +40,17 @@
     "x_left": 0.05,
     "x_right": 0.95,
     "danger_radius_ratio": 0.12,
-    "danger_ahead_ratio": 0.4,
+    "danger_ahead_ratio": 0.48,
     "danger_behind_ratio": 0.12,
     "gesture_lookahead_ratio": 0.06,
-    "sweep_ms": 80,
+    "sweep_ms": 110,
     "escape_ms": 120,
     "clear_frames": 2,
     "control_y": 0.67,
     "scrcpy_window_title": "RMX3853",
-    "blocked_poll_s": 0.015
+    "blocked_poll_s": 0.015,
+    "hazard_min_area_ratio": 0.0018,
+    "hazard_max_area_ratio": 0.03
   },
   "economy": {
     "max_oxygen_purchases_per_home": 8,
@@ -71,7 +73,9 @@
         "every_runs": 8
       }
     ],
-    "upgrade_signature_change_min": 0.0035
+    "upgrade_signature_change_min": 0.0035,
+    "buy_upgrades": false,
+    "upgrade_mode": "smart"
   },
   "timing": {
     "gameplay_loop_s": 0,
@@ -85,5 +89,26 @@
     "start_retry_cooldown_s": 2
   },
   "control_backend": "adb_direct",
-  "capture_backend": "adb_screencap"
+  "capture_backend": "adb_screencap",
+  "economy_ocr": {
+    "digit_confidence_min": 0.82,
+    "coins_roi": [
+      0.4,
+      0.195,
+      0.74,
+      0.25
+    ],
+    "bag_cost_roi": [
+      0.19,
+      0.79,
+      0.36,
+      0.84
+    ],
+    "oxygen_cost_roi": [
+      0.43,
+      0.79,
+      0.65,
+      0.84
+    ]
+  }
 }

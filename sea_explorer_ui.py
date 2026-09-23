@@ -775,9 +775,9 @@ class SeaExplorerWindow:
 
     def _open_settings(self):
         if self.running or self.busy:
-            self._set_status("Finish the current operation before changing tool paths.", error=True)
+            self._set_status("Finish the current operation before changing settings.", error=True)
             return
-        dialog = tk.Toplevel(self.root)
+        dialog=tk.Toplevel(self.root)
         dialog.title("Sea Explorer · Settings")
         if ICON_PATH.is_file():
             try:
@@ -786,32 +786,87 @@ class SeaExplorerWindow:
                 pass
         dialog.configure(bg=COLORS["bg"])
         dialog.transient(self.root)
-        dialog.resizable(False, False)
-        dialog.geometry("590x270")
-        panel = tk.Frame(dialog, bg=COLORS["bg"], padx=22, pady=20)
-        panel.pack(fill="both", expand=True)
-        self._label(panel, "Tool locations", size=16, weight="bold").pack(anchor="w")
-        self._label(panel, "ADB is required. scrcpy is kept only for legacy builds and is not used by ADB Direct mode.", size=9, color="muted").pack(anchor="w", pady=(3, 15))
-        adb_var = tk.StringVar(value=str(self.settings.get("adb_path", "")))
-        scrcpy_var = tk.StringVar(value=str(self.settings.get("scrcpy_path", "")))
-        for caption, variable in (("ADB EXECUTABLE", adb_var), ("SCRCPY EXECUTABLE (LEGACY / OPTIONAL)", scrcpy_var)):
-            self._label(panel, caption, size=8, color="muted", weight="bold").pack(anchor="w", pady=(0, 5))
-            row = tk.Frame(panel, bg=COLORS["bg"])
-            row.pack(fill="x", pady=(0, 11))
-            self._entry(row, variable).pack(side="left", fill="x", expand=True, ipady=6)
-            self._button(row, "Browse", lambda v=variable: self._browse_executable(v, dialog)).pack(side="left", padx=(7, 0))
+        dialog.resizable(False,False)
+        dialog.geometry("610x430")
+        panel=tk.Frame(dialog,bg=COLORS["bg"],padx=22,pady=18)
+        panel.pack(fill="both",expand=True)
+
+        self._label(panel,"Automation settings",size=16,weight="bold").pack(anchor="w")
+        self._label(
+            panel,
+            "Upgrade buying is optional. When enabled, the bot reads coins and prices first; it never has to tap blindly.",
+            size=9,color="muted",wraplength=555,justify="left"
+        ).pack(anchor="w",pady=(3,14))
+
+        buy_var=tk.BooleanVar(value=bool(self.settings.get("buy_upgrades",False)))
+        stored_mode=str(self.settings.get("upgrade_mode","smart"))
+        mode_to_label={
+            "smart":"Smart — Bag + Oxygen",
+            "bag":"Bag only",
+            "oxygen":"Oxygen only",
+        }
+        label_to_mode={value:key for key,value in mode_to_label.items()}
+        upgrade_var=tk.StringVar(value=mode_to_label.get(stored_mode,mode_to_label["smart"]))
+
+        buy_check=tk.Checkbutton(
+            panel,
+            text="Buy upgrades when affordable",
+            variable=buy_var,
+            bg=COLORS["bg"],fg=COLORS["text"],
+            activebackground=COLORS["bg"],activeforeground=COLORS["text"],
+            selectcolor=COLORS["field"],
+            font=("Segoe UI Semibold",10),
+            anchor="w",
+        )
+        buy_check.pack(fill="x",anchor="w")
+
+        self._label(panel,"UPGRADE TYPE",size=8,color="muted",weight="bold").pack(anchor="w",pady=(8,5))
+        upgrade_combo=ttk.Combobox(
+            panel,
+            textvariable=upgrade_var,
+            values=tuple(mode_to_label.values()),
+            state="readonly",
+            style="Sea.TCombobox",
+        )
+        upgrade_combo.pack(fill="x",pady=(0,14))
+
+        def sync_upgrade_state(*_):
+            upgrade_combo.configure(state="readonly" if buy_var.get() else "disabled")
+        buy_var.trace_add("write",sync_upgrade_state)
+        sync_upgrade_state()
+
+        self._label(panel,"Tool locations",size=12,weight="bold").pack(anchor="w",pady=(0,8))
+        adb_var=tk.StringVar(value=str(self.settings.get("adb_path","")))
+        scrcpy_var=tk.StringVar(value=str(self.settings.get("scrcpy_path","")))
+        for caption,variable in (
+            ("ADB EXECUTABLE",adb_var),
+            ("SCRCPY EXECUTABLE (LEGACY / OPTIONAL)",scrcpy_var),
+        ):
+            self._label(panel,caption,size=8,color="muted",weight="bold").pack(anchor="w",pady=(0,4))
+            row=tk.Frame(panel,bg=COLORS["bg"])
+            row.pack(fill="x",pady=(0,9))
+            self._entry(row,variable).pack(side="left",fill="x",expand=True,ipady=5)
+            self._button(row,"Browse",lambda v=variable:self._browse_executable(v,dialog)).pack(side="left",padx=(7,0))
 
         def save():
-            self.settings["adb_path"] = adb_var.get().strip()
-            self.settings["scrcpy_path"] = scrcpy_var.get().strip()
+            old_adb=str(self.settings.get("adb_path",""))
+            old_scrcpy=str(self.settings.get("scrcpy_path",""))
+            self.settings["adb_path"]=adb_var.get().strip()
+            self.settings["scrcpy_path"]=scrcpy_var.get().strip()
+            self.settings["buy_upgrades"]=bool(buy_var.get())
+            self.settings["upgrade_mode"]=label_to_mode.get(upgrade_var.get(),"smart")
             self._persist_settings()
-            self.connected_serial = None
-            self.connected_mode = None
+            if old_adb!=self.settings["adb_path"] or old_scrcpy!=self.settings["scrcpy_path"]:
+                self.connected_serial=None
+                self.connected_mode=None
+                self._set_status("Tool paths saved. Reconnect the device before starting.")
+            else:
+                state="enabled" if self.settings["buy_upgrades"] else "disabled"
+                self._set_status(f"Settings saved. Upgrade buying is {state}.")
             self._update_controls()
-            self._set_status("Tool paths saved. Reconnect the device before starting.")
             dialog.destroy()
 
-        self._button(panel, "Save settings", save, kind="aqua").pack(anchor="e")
+        self._button(panel,"Save settings",save,kind="aqua").pack(anchor="e",pady=(3,0))
         dialog.grab_set()
 
     def _browse_executable(self, variable: tk.StringVar, parent: tk.Misc):
@@ -838,6 +893,10 @@ class SeaExplorerWindow:
         serial = self.connected_serial
         mode = self.connected_mode
         config["adb_path"] = str(self.settings.get("adb_path") or config.get("adb_path", ""))
+        economy=config.setdefault("economy",{})
+        economy["buy_upgrades"]=bool(self.settings.get("buy_upgrades",False))
+        mode=str(self.settings.get("upgrade_mode","smart")).lower()
+        economy["upgrade_mode"]=mode if mode in {"smart","bag","oxygen"} else "smart"
         self.stop_event = threading.Event()
         self.running = True
         self._update_controls()

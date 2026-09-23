@@ -18,7 +18,7 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parent
-BUILD = "adb-direct-continuous-2"
+BUILD = "adb-direct-smart-economy-3"
 CONFIG_PATH = ROOT / "config.json"
 STATE_PATH = ROOT / "progress_state.json"
 LOG_PATH = ROOT / "sea_explorer.log"
@@ -277,6 +277,17 @@ class Detection:
 class Vision:
     def __init__(self, cfg):
         self.cfg = cfg
+        self._digit_templates = None
+        template_path = ROOT / "assets" / "coin_digits.npz"
+        try:
+            with np.load(template_path) as data:
+                templates = np.asarray(data["templates"], dtype=np.float32)
+            if templates.shape == (10, 44, 32):
+                self._digit_templates = templates
+            else:
+                log(f"Ignoring invalid economy OCR templates: {templates.shape}")
+        except Exception as exc:
+            log(f"Economy OCR templates unavailable; upgrades will be skipped safely: {exc}")
 
     @staticmethod
     def _hsv(frame):
@@ -448,57 +459,159 @@ class Vision:
             return 0.0
         return float(np.mean(before != after))
 
-    def hazards(self, frame):
-        """Find the spiky purple puffer/zombie hazards, while rejecting purple pipes/coral.
-
-        The supplied recordings show the hazard as a ~square purple component with
-        low contour circularity/solidity because of its spikes. Static purple pipes
-        are noticeably smoother/more solid.
-        """
-        hsv=self._hsv(frame)
+    @staticmethod
+    def _economy_digit_mask(crop: np.ndarray) -> np.ndarray:
+        """White/red digit fill used by the HOME coin and upgrade-cost labels."""
+        hsv=cv2.cvtColor(crop,cv2.COLOR_BGR2HSV)
         H,S,V=cv2.split(hsv)
-        # The bomb is violet (H ~141); red coral near H 177 caused false evades.
+        white=(S<115)&(V>145)
+        # When the balance is below a price the game renders it red.
+        # Keep this deliberately tight so the dark orange panel is rejected.
+        red=(V>180)&(S>120)&((H<=3)|(H>=170))
+        return ((white|red).astype(np.uint8)*255)
+
+    @staticmethod
+    def _normalize_digit(mask: np.ndarray, out_w: int = 32, out_h: int = 44) -> np.ndarray | None:
+        ys,xs=np.where(mask>0)
+        if len(xs)==0:
+            return None
+        glyph=mask[ys.min():ys.max()+1,xs.min():xs.max()+1]
+        scale=min((out_w-4)/max(1,glyph.shape[1]),(out_h-4)/max(1,glyph.shape[0]))
+        new_w=max(1,int(round(glyph.shape[1]*scale)))
+        new_h=max(1,int(round(glyph.shape[0]*scale)))
+        resized=cv2.resize(glyph,(new_w,new_h),interpolation=cv2.INTER_NEAREST)
+        canvas=np.zeros((out_h,out_w),np.float32)
+        x=(out_w-new_w)//2
+        y=(out_h-new_h)//2
+        canvas[y:y+new_h,x:x+new_w]=(resized>0).astype(np.float32)
+        return canvas
+
+    def _read_number_roi(self, frame: np.ndarray, roi) -> tuple[int | None, float]:
+        if self._digit_templates is None:
+            return None,0.0
+        h,w=frame.shape[:2]
+        x1,y1,x2,y2=map(float,roi)
+        crop=frame[
+            int(clamp(y1,0,1)*h):int(clamp(y2,0,1)*h),
+            int(clamp(x1,0,1)*w):int(clamp(x2,0,1)*w),
+        ]
+        if crop.size==0:
+            return None,0.0
+        mask=self._economy_digit_mask(crop)
+        n,_,stats,_=cv2.connectedComponentsWithStats(mask,8)
+        area_total=max(1,crop.shape[0]*crop.shape[1])
+        glyphs=[]
+        for i in range(1,n):
+            x,y,bw,bh,area=map(int,stats[i])
+            if area<max(8,int(area_total*.001)):
+                continue
+            if bh<crop.shape[0]*.25 or bh>crop.shape[0]*.95 or bw<2 or bw>crop.shape[1]*.60:
+                continue
+            glyphs.append((x,mask[y:y+bh,x:x+bw]))
+        glyphs.sort(key=lambda item:item[0])
+        if not glyphs or len(glyphs)>6:
+            return None,0.0
+
+        digits=[]
+        confidences=[]
+        for _,raw in glyphs:
+            glyph=self._normalize_digit(raw)
+            if glyph is None:
+                return None,0.0
+            g=glyph.reshape(-1)
+            gnorm=float(np.linalg.norm(g))
+            best_digit=None
+            best_score=-1.0
+            for digit,template in enumerate(self._digit_templates):
+                t=template.reshape(-1)
+                denom=gnorm*float(np.linalg.norm(t))
+                score=float(np.dot(g,t)/denom) if denom>0 else 0.0
+                if score>best_score:
+                    best_score=score
+                    best_digit=digit
+            digits.append(str(best_digit))
+            confidences.append(best_score)
+
+        confidence=min(confidences) if confidences else 0.0
+        minimum=float(self.cfg.get("economy_ocr",{}).get("digit_confidence_min",.82))
+        if confidence<minimum:
+            return None,confidence
+        try:
+            return int("".join(digits)),confidence
+        except ValueError:
+            return None,confidence
+
+    def read_home_economy(self, frame: np.ndarray) -> dict:
+        """Read current coins and visible upgrade prices without tapping anything."""
+        ocr=self.cfg.get("economy_ocr",{})
+        fields={
+            "coins": ocr.get("coins_roi",[.40,.195,.74,.25]),
+            "bag_cost": ocr.get("bag_cost_roi",[.19,.79,.36,.84]),
+            "oxygen_cost": ocr.get("oxygen_cost_roi",[.43,.79,.65,.84]),
+        }
+        result={}
+        confidence={}
+        for name,roi in fields.items():
+            value,score=self._read_number_roi(frame,roi)
+            result[name]=value
+            confidence[name]=score
+        result["confidence"]=confidence
+        return result
+
+    def hazards(self, frame, hsv=None):
+        """Find purple spiky bombs early without touching the swipe cadence.
+
+        The old detector ignored the bomb until it occupied 0.6% of the whole
+        screen, which was unnecessarily late. Keep the same shape rejection for
+        pipes/coral but allow smaller, farther-away bombs to trigger avoidance.
+        """
+        if hsv is None:
+            hsv=self._hsv(frame)
+        H=hsv[:,:,0]; S=hsv[:,:,1]; V=hsv[:,:,2]
         mask=((H>=125)&(H<=155)&(S>=70)&(V>=50)).astype(np.uint8)*255
         h,w=mask.shape
         mask[:int(.07*h)]=0
         mask[int(.93*h):]=0
         cnts,_=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
         found=[]
+        motion=self.cfg.get("motion",{})
+        min_ratio=float(motion.get("hazard_min_area_ratio",.0018))
+        max_ratio=float(motion.get("hazard_max_area_ratio",.030))
         for cnt in cnts:
             area=float(cv2.contourArea(cnt))
-            if area <= 0:
+            if area<=0:
                 continue
             x,y,bw,bh=cv2.boundingRect(cnt)
             ratio=area/(w*h)
             aspect=bw/max(1.0,bh)
-            if not (0.006 <= ratio <= 0.030 and 0.70 <= aspect <= 1.40):
+            if not (min_ratio<=ratio<=max_ratio and .68<=aspect<=1.45):
                 continue
             peri=cv2.arcLength(cnt,True)
-            if peri <= 0:
+            if peri<=0:
                 continue
             circ=4*math.pi*area/(peri*peri)
             hull=cv2.convexHull(cnt)
             hull_area=cv2.contourArea(hull)
             solidity=area/hull_area if hull_area>0 else 1.0
-            # Tuned on the two supplied recordings:
-            # hazard ~ circularity .27-.33 / solidity .77-.82;
-            # purple pipe cluster ~ .49 / .91.
-            if circ <= .42 and solidity <= .86:
+            # Spiky bomb: irregular outline. Purple pipes are much smoother/solid.
+            # Slightly relax only the tiny/far case so it is noticed earlier.
+            tiny=ratio<.006
+            circ_limit=.46 if tiny else .42
+            solidity_limit=.88 if tiny else .86
+            if circ<=circ_limit and solidity<=solidity_limit:
                 cx=int(x+bw/2); cy=int(y+bh/2)
-                radius=int(max(bw,bh)*.70)
+                radius=int(max(bw,bh)*(.78 if tiny else .70))
                 found.append((cx,cy,radius))
         return tuple(found)
 
     def detect(self, frame):
         hsv=self._hsv(frame)
         h,w=frame.shape[:2]
-        H,S,V=cv2.split(hsv)
+        V=hsv[:,:,2]
         dark=float(np.mean(V<70))
 
-        blue_popup, popup_close=self._large_blue_popup(hsv)
-        if blue_popup:
-            return Detection("NOT_ENOUGH", .98, popup_close=popup_close)
-
+        # During a dive, skip the expensive large-popup connected-component scan.
+        # Reuse this same HSV frame for bomb detection instead of converting twice.
         if self._win_machine(hsv):
             close=self._win_machine_close(hsv)
             if close is None:
@@ -506,17 +619,20 @@ class Vision:
             return Detection("WIN_MACHINE", .98, popup_close=close)
 
         if self._gameplay_hud(hsv):
-            return Detection("PLAYING", .99, hazards=self.hazards(frame))
+            return Detection("PLAYING", .99, hazards=self.hazards(frame,hsv=hsv))
+
+        blue_popup,popup_close=self._large_blue_popup(hsv)
+        if blue_popup:
+            return Detection("NOT_ENOUGH", .98, popup_close=popup_close)
 
         if self._home(hsv):
             return Detection("HOME", .97)
 
         orange=self._lower_orange_button(hsv)
-        if dark >= .22 and orange is not None:
+        if dark>=.22 and orange is not None:
             return Detection("RESULT", .90, orange_button=orange)
 
-        # A darkened transitional/reward frame without its button fully visible yet.
-        if dark >= .30:
+        if dark>=.30:
             return Detection("TRANSITION", .65)
 
         return Detection("UNKNOWN", .30)
@@ -943,41 +1059,81 @@ class SeaExplorerBot:
 
         goal=int(self.cfg["goal_oxygen_level"])
 
-        # Upgrades are handled only once per HOME visit. If TAP TO DROP misses,
-        # later HOME loops retry starting the dive without spending again.
         if self.home_handled:
             self._start_next_dive(frame)
             return
         self.home_handled=True
-        if self.progress.oxygen_level_estimate >= goal:
+        if self.progress.oxygen_level_estimate>=goal:
             log(f"GOAL REACHED: estimated oxygen level {self.progress.oxygen_level_estimate} >= {goal}")
             raise SystemExit(0)
 
+        economy=self.cfg.get("economy",{})
+        if not bool(economy.get("buy_upgrades",False)):
+            log("Upgrade buying is OFF -> starting next dive immediately.")
+            self._start_next_dive(frame)
+            return
+
+        mode=str(economy.get("upgrade_mode","smart")).lower()
+        if mode not in {"smart","bag","oxygen"}:
+            mode="smart"
+
+        def snapshot(current_frame):
+            values=self.vision.read_home_economy(current_frame)
+            log(
+                "HOME economy: "
+                f"coins={values.get('coins')} "
+                f"bag={values.get('bag_cost')} "
+                f"oxygen={values.get('oxygen_cost')} "
+                f"mode={mode}"
+            )
+            return values
+
+        values=snapshot(frame)
+        if values.get("coins") is None:
+            log("Could not read coin balance confidently -> skipping upgrades, no blind taps.")
+            self._start_next_dive(frame)
+            return
+
         cadence=self._bag_cadence()
-        due=(self.progress.runs_completed-self.progress.last_bag_attempt_run)>=cadence
-        if due and self.progress.runs_completed>0:
-            self.progress.last_bag_attempt_run=self.progress.runs_completed
-            self.progress.save()
-            # Bag is the income engine. In the recordings, 7 slots fill long
-            # before 170 oxygen is exhausted, so invest periodically.
-            self._attempt_upgrade(frame,"bag")
-            self._sleep(.35)
-            frame=self.adb.screenshot()
+        bag_due=(self.progress.runs_completed-self.progress.last_bag_attempt_run)>=cadence
+        if mode in {"smart","bag"} and bag_due and self.progress.runs_completed>0:
+            coins=values.get("coins")
+            cost=values.get("bag_cost")
+            if cost is None:
+                log("Bag price unreadable -> skipping bag purchase safely.")
+            elif coins<cost:
+                log(f"Bag upgrade skipped: {coins} coins < {cost} required.")
+            else:
+                self.progress.last_bag_attempt_run=self.progress.runs_completed
+                self.progress.save()
+                if self._attempt_upgrade(frame,"bag"):
+                    self._sleep(.15)
+                    frame=self.adb.screenshot()
+                    values=snapshot(frame)
 
-        # Oxygen is the actual objective. Spend as much as currently affordable,
-        # but cap the batch so a single HOME visit cannot loop forever.
-        for _ in range(int(self.cfg["economy"]["max_oxygen_purchases_per_home"])):
-            self._check_stop()
-            if self.progress.oxygen_level_estimate >= goal:
-                log(f"GOAL REACHED: estimated oxygen level {self.progress.oxygen_level_estimate} >= {goal}")
-                raise SystemExit(0)
-            ok=self._attempt_upgrade(frame,"oxygen")
-            if not ok:
-                break
-            self._sleep(.25)
-            frame=self.adb.screenshot()
+        if mode in {"smart","oxygen"}:
+            for _ in range(int(economy.get("max_oxygen_purchases_per_home",8))):
+                self._check_stop()
+                if self.progress.oxygen_level_estimate>=goal:
+                    log(f"GOAL REACHED: estimated oxygen level {self.progress.oxygen_level_estimate} >= {goal}")
+                    raise SystemExit(0)
 
-        # Drop back in for another earning run, and verify it actually started.
+                coins=values.get("coins")
+                cost=values.get("oxygen_cost")
+                if coins is None or cost is None:
+                    log("Coin/oxygen price unreadable -> stopping purchase loop with no blind tap.")
+                    break
+                if coins<cost:
+                    log(f"Oxygen upgrade skipped: {coins} coins < {cost} required.")
+                    break
+
+                ok=self._attempt_upgrade(frame,"oxygen")
+                if not ok:
+                    break
+                self._sleep(.15)
+                frame=self.adb.screenshot()
+                values=snapshot(frame)
+
         self._start_next_dive(frame)
 
     def _recover_unknown(self, frame):
