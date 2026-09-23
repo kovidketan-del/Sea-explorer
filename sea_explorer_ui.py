@@ -823,10 +823,17 @@ class SeaExplorerWindow:
                 pass
         dialog.configure(bg=COLORS["bg"])
         dialog.transient(self.root)
-        dialog.resizable(False,False)
-        dialog.geometry("620x585")
+        dialog.resizable(True,True)
+        dialog.geometry("620x660")
+        dialog.minsize(620,560)
+
+        # Keep Save permanently visible even when Windows DPI/font scaling makes
+        # the settings body taller than expected.
+        footer=tk.Frame(dialog,bg=COLORS["bg"],padx=22,pady=(8,16))
+        footer.pack(side="bottom",fill="x")
+
         panel=tk.Frame(dialog,bg=COLORS["bg"],padx=22,pady=18)
-        panel.pack(fill="both",expand=True)
+        panel.pack(side="top",fill="both",expand=True)
 
         self._label(panel,"Automation settings",size=16,weight="bold").pack(anchor="w")
         self._label(
@@ -959,7 +966,14 @@ class SeaExplorerWindow:
             self._update_controls()
             dialog.destroy()
 
-        self._button(panel,"Save settings",save,kind="aqua").pack(anchor="e",pady=(2,0))
+        self._button(footer,"Save settings",save,kind="aqua").pack(side="right")
+        self._label(
+            footer,
+            "Changes apply on the next bot start.",
+            size=8,
+            color="muted",
+        ).pack(side="left")
+        dialog.bind("<Return>",lambda _event:save())
         dialog.grab_set()
 
     def _browse_executable(self, variable: tk.StringVar, parent: tk.Misc):
