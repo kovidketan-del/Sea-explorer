@@ -35,9 +35,9 @@ class ConnectionManagerTests(unittest.TestCase):
             ("emulator-5554", "device"),
         ])
         self.assertEqual(self.manager.usb_devices(), ["RMX3853"])
-        run.assert_called_with(
-            [ADB, "devices"], capture_output=True, text=True, timeout=10, check=False
-        )
+        self.assertEqual(run.call_args.args[0], [ADB, "devices"])
+        self.assertTrue(run.call_args.kwargs["capture_output"])
+        self.assertEqual(run.call_args.kwargs["timeout"], 10)
 
     @patch("connection_manager.subprocess.run")
     def test_usb_selects_exact_serial_and_rejects_unauthorized(self, run):

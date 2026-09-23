@@ -43,11 +43,12 @@
     "danger_ahead_ratio": 0.4,
     "danger_behind_ratio": 0.12,
     "gesture_lookahead_ratio": 0.06,
-    "sweep_ms": 250,
-    "escape_ms": 180,
+    "sweep_ms": 110,
+    "escape_ms": 120,
     "clear_frames": 2,
     "control_y": 0.67,
-    "scrcpy_window_title": "RMX3853"
+    "scrcpy_window_title": "RMX3853",
+    "blocked_poll_s": 0.015
   },
   "economy": {
     "max_oxygen_purchases_per_home": 8,

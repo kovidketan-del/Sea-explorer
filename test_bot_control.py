@@ -3,7 +3,7 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from sea_explorer_bot import ADB, BotError, SeaExplorerBot, StopRequested
+from sea_explorer_bot import ADB, ADBTouch, BotError, SeaExplorerBot, StopRequested
 
 
 class DeviceBindingTests(unittest.TestCase):
@@ -35,26 +35,24 @@ class DeviceBindingTests(unittest.TestCase):
             self.assertIsNone(adb.serial)
 
     @patch("sea_explorer_bot.Sweeper")
-    @patch("sea_explorer_bot.ScrcpyTouch")
     @patch("sea_explorer_bot.Progress.load")
     @patch("sea_explorer_bot.Vision")
     @patch("sea_explorer_bot.ADB")
-    def test_bot_passes_serial_and_mirror_title_without_usb_stay_awake_for_wireless(
-        self, adb_class, _vision, _progress_load, touch_class, sweeper_class
+    def test_bot_uses_direct_adb_touch_and_respects_wireless_transport(
+        self, adb_class, _vision, _progress_load, sweeper_class
     ):
         adb = adb_class.return_value
         adb.serial = "192.0.2.10:5555"
-        cfg = {"adb_path": "", "starting_oxygen_level": 230,
-               "motion": {"scrcpy_window_title": "Default Mirror"}}
+        cfg = {"adb_path": "", "starting_oxygen_level": 230, "motion": {}}
 
-        bot = SeaExplorerBot(cfg, serial=adb.serial, transport="wireless",
-                             window_title="Selected Mirror")
+        SeaExplorerBot(cfg, serial=adb.serial, transport="wireless")
 
         adb.ensure_ready.assert_called_once_with("192.0.2.10:5555")
         adb.keep_awake_usb.assert_not_called()
-        touch_class.assert_called_once_with("Selected Mirror")
-        sweeper_class.assert_called_once_with(touch_class.return_value, cfg)
-        self.assertEqual(bot.capture_title, "Selected Mirror")
+        touch=sweeper_class.call_args.args[0]
+        self.assertIsInstance(touch, ADBTouch)
+        self.assertIs(touch.adb, adb)
+        self.assertEqual(sweeper_class.call_args.args[1], cfg)
 
 
 class StopControlTests(unittest.TestCase):
@@ -76,7 +74,6 @@ class StopControlTests(unittest.TestCase):
         bot = SeaExplorerBot.__new__(SeaExplorerBot)
         bot.stop_event = threading.Event()
         bot.stop_event.set()
-        bot.capture = None
         bot.sweeper = Mock(active=False)
         bot.adb = Mock()
         bot.dry_run = False

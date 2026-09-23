@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -17,7 +18,7 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parent
-BUILD = "adb-direct-1"
+BUILD = "adb-direct-continuous-2"
 CONFIG_PATH = ROOT / "config.json"
 STATE_PATH = ROOT / "progress_state.json"
 LOG_PATH = ROOT / "sea_explorer.log"
@@ -49,6 +50,19 @@ def load_config() -> dict:
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
+
+
+def _hidden_subprocess_kwargs() -> dict:
+    """Keep ADB helper processes invisible when the dashboard uses pythonw."""
+    if os.name != "nt":
+        return {}
+    startup = subprocess.STARTUPINFO()
+    startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startup.wShowWindow = subprocess.SW_HIDE
+    return {
+        "startupinfo": startup,
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    }
 
 
 class ADB:
@@ -90,7 +104,10 @@ class ADB:
             if not p.is_file():
                 continue
             try:
-                r = subprocess.run([str(p), "version"], capture_output=True, text=True, timeout=5)
+                r = subprocess.run(
+                    [str(p), "version"], capture_output=True, text=True, timeout=5,
+                    **_hidden_subprocess_kwargs(),
+                )
                 if r.returncode == 0:
                     return str(p)
             except Exception:
@@ -106,7 +123,10 @@ class ADB:
 
     def run(self, *args, text=True, check=True, timeout=20):
         try:
-            r = subprocess.run(self._cmd(*args), capture_output=True, text=text, timeout=timeout)
+            r = subprocess.run(
+                self._cmd(*args), capture_output=True, text=text, timeout=timeout,
+                **_hidden_subprocess_kwargs(),
+            )
         except subprocess.TimeoutExpired as e:
             raise BotError(f"ADB timeout: {' '.join(map(str,args))}") from e
         if check and r.returncode != 0:
@@ -152,6 +172,7 @@ class ADB:
         self.run(
             "shell", "input", "touchscreen", "swipe",
             int(x1), int(y1), int(x2), int(y2), int(duration_ms),
+            timeout=5,
         )
 
     def back(self):
@@ -502,7 +523,13 @@ class Vision:
 
 
 class Sweeper:
-    """One fast observed pass at a time, with a held touch and bomb parking."""
+    """Continuous ADB sweep worker with asynchronous hazard supervision.
+
+    Vision and motion run independently: ADB screenshots can take a noticeable
+    fraction of a second, but the movement worker keeps alternating left/right
+    during that time. Hazard observations can park or escape the worker at the
+    boundary of the current short swipe.
+    """
 
     def __init__(self, touch: ADBTouch, cfg: dict):
         self.touch=touch
@@ -516,23 +543,64 @@ class Sweeper:
         self.clear_frames=0
         self.escape_y=None
 
+        self._lock=threading.Lock()
+        self._stop_worker=threading.Event()
+        self._wake_worker=threading.Event()
+        self._worker=None
+        self._frame_size=None
+        self._threat_cache=()
+        self._status="IDLE"
+        self._worker_error=None
+
+    def _start_worker_if_needed(self, w, h):
+        if self._worker is not None and self._worker.is_alive():
+            return
+        self._stop_worker.clear()
+        self._wake_worker.clear()
+        self._frame_size=(w,h)
+        start=self.last_target or self._px((.5,self.control_y),w,h)
+        if not self.touch.active:
+            self.touch.begin(*start,w,h)
+        self.last_target=start
+        self.active=True
+        self._worker=threading.Thread(
+            target=self._motion_loop,
+            name="SeaExplorer-ADB-Sweep",
+            daemon=True,
+        )
+        self._worker.start()
+
     def stop(self):
+        self._stop_worker.set()
+        self._wake_worker.set()
+        worker=self._worker
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=1.5)
         release_error=None
-        if self.active:
-            try:
+        try:
+            if self.touch is not None:
                 self.touch.release()
-            except Exception as e:
-                self.release_failed=True
-                release_error=e
-                log(f"Could not release held touch: {e}")
-        self.active=False
-        self.last_target=None
-        self.blocked=False
-        self.clear_frames=0
-        self.escape_y=None
-        self.swipes_sent=0
+        except Exception as exc:
+            release_error=exc
+            self.release_failed=True
+            log(f"Could not stop ADB touch adapter: {exc}")
+
+        with self._lock:
+            self.active=False
+            self.last_target=None
+            self.blocked=False
+            self.clear_frames=0
+            self.escape_y=None
+            self._threat_cache=()
+            self._frame_size=None
+            self._status="IDLE"
+            self._worker=None
+
+        if worker is not None and worker.is_alive():
+            self.release_failed=True
+            raise BotError("ADB movement worker did not stop within 1.5 seconds")
         if release_error is not None:
-            raise BotError("Could not release the held touch; stopping bot") from release_error
+            raise BotError("Could not stop ADB movement controller") from release_error
 
     def _px(self, norm, w, h):
         return (
@@ -542,7 +610,6 @@ class Sweeper:
 
     @staticmethod
     def _clearance(start, end, hazards, margin):
-        """Smallest distance from a complete stroke to a hazard's safe edge."""
         ax,ay=start; bx,by=end
         dx=bx-ax; dy=by-ay
         length2=dx*dx+dy*dy
@@ -554,7 +621,6 @@ class Sweeper:
         return best
 
     def _threats(self, hazards, h):
-        """Bombs descend through the diver's row; watch above it before arrival."""
         m=self.cfg["motion"]
         row=self.control_y*h
         ahead=float(m.get("danger_ahead_ratio",.40))*h
@@ -563,77 +629,143 @@ class Sweeper:
 
     @staticmethod
     def _horizontal_clearance(x, hazards, margin):
+        if not hazards:
+            return float("inf")
         return min(abs(x-hx)-radius-margin for hx,_,radius in hazards)
+
+    def _motion_loop(self):
+        try:
+            while not self._stop_worker.is_set():
+                with self._lock:
+                    frame_size=self._frame_size
+                    blocked=self.blocked
+                    threats=tuple(self._threat_cache)
+                    start=self.last_target
+                    escape_y=self.escape_y
+
+                if frame_size is None:
+                    self._wake_worker.wait(.01)
+                    self._wake_worker.clear()
+                    continue
+
+                w,h=frame_size
+                m=self.cfg["motion"]
+                row_y=int(self.control_y*h)
+                left=self._px((m["x_left"],self.control_y),w,h)[0]
+                right=self._px((m["x_right"],self.control_y),w,h)[0]
+                margin=float(m.get("danger_radius_ratio",.12))*w
+                sweep_ms=int(m.get("sweep_ms",110))
+                escape_ms=int(m.get("escape_ms",120))
+                start=start or (w//2,row_y)
+
+                if blocked:
+                    target=start
+                    reason="PARK-CONFIRM"
+                    new_escape=escape_y
+
+                    if threats:
+                        if escape_y is not None:
+                            reason="PARK-ESCAPED"
+                        elif self._horizontal_clearance(start[0],threats,margin) > 0:
+                            reason="PARK-SAFE"
+                        else:
+                            safe_edge=max(
+                                (left,right),
+                                key=lambda x:self._horizontal_clearance(x,threats,margin),
+                            )
+                            edge=(safe_edge,start[1])
+                            lookahead=float(m.get("gesture_lookahead_ratio",.06))*h
+                            if (
+                                self._horizontal_clearance(safe_edge,threats,margin)>0
+                                and self._clearance(start,edge,threats,margin+lookahead)>0
+                            ):
+                                target=edge
+                                reason="PARK-MOVE"
+                            else:
+                                nearest=min(threats,key=lambda v:math.dist(start,(v[0],v[1])))
+                                candidate_y=.52 if nearest[1]>start[1] else .82
+                                escape=(start[0],int(candidate_y*h))
+                                start_clear=self._clearance(start,start,threats,margin)
+                                path_clear=self._clearance(start,escape,threats,margin)
+                                end_clear=self._clearance(escape,escape,threats,margin)
+                                if end_clear>start_clear and path_clear>=start_clear-2:
+                                    target=escape
+                                    new_escape=candidate_y
+                                    reason="ESCAPE"
+                                else:
+                                    reason="HOLD-TRAPPED"
+
+                    if target != start:
+                        self.touch.move_to(
+                            *target,
+                            escape_ms if reason=="ESCAPE" else sweep_ms,
+                            w,h,
+                        )
+                        with self._lock:
+                            self.last_target=target
+                            self.escape_y=new_escape
+
+                    with self._lock:
+                        self._status=f"{reason} hazards={len(threats)}"
+                    self._wake_worker.wait(float(m.get("blocked_poll_s",.015)))
+                    self._wake_worker.clear()
+                    continue
+
+                # Once danger clears, return from a temporary vertical escape,
+                # then resume uninterrupted alternating horizontal swipes.
+                if escape_y is not None and start[1] != row_y:
+                    target=(start[0],row_y)
+                    self.touch.move_to(*target,escape_ms,w,h)
+                    with self._lock:
+                        self.last_target=target
+                        self.escape_y=None
+                        self._status="RETURN-LANE"
+                    continue
+
+                target=(right,row_y) if start[0] <= (left+right)/2 else (left,row_y)
+                self.touch.move_to(*target,sweep_ms,w,h)
+                with self._lock:
+                    self.last_target=target
+                    self.swipes_sent+=1
+                    direction="RIGHT" if target[0] == right else "LEFT"
+                    self._status=f"CONTINUOUS-{direction} #{self.swipes_sent}"
+        except Exception as exc:
+            with self._lock:
+                self._worker_error=exc
+                self._status=f"MOTION-ERROR {type(exc).__name__}"
+            self._stop_worker.set()
 
     def step(self, frame, hazards, dry_run=False):
         h,w=frame.shape[:2]
-        m=self.cfg["motion"]
-        start=self.last_target or self._px((.5,self.control_y),w,h)
-        row_y=int(self.control_y*h)
-        left=self._px((m["x_left"],self.control_y),w,h)[0]
-        right=self._px((m["x_right"],self.control_y),w,h)[0]
         threats=self._threats(hazards,h)
-        margin=float(m.get("danger_radius_ratio",.12))*w
-        end=start
-        reason="HOLD"
-        duration_ms=int(m.get("sweep_ms",250))
 
-        if threats:
-            self.blocked=True
-            self.clear_frames=0
-            if self.escape_y is not None:
-                reason="PARK-ESCAPED"
-            elif self._horizontal_clearance(start[0],threats,margin) > 0:
-                reason="PARK-SAFE"
-            else:
-                safe_edge=max((left,right),key=lambda x:self._horizontal_clearance(x,threats,margin))
-                candidate=(safe_edge,start[1])
-                lookahead=float(m.get("gesture_lookahead_ratio",.06))*h
-                if (self._horizontal_clearance(safe_edge,threats,margin)>0
-                    and self._clearance(start,candidate,threats,margin+lookahead)>0):
-                    end=candidate
-                    reason="PARK-MOVE"
-                else:
-                    nearest=min(threats,key=lambda v:math.dist(start,(v[0],v[1])))
-                    escape_y=.52 if nearest[1]>start[1] else .82
-                    candidate=(start[0],int(escape_y*h))
-                    start_clear=self._clearance(start,start,threats,margin)
-                    path_clear=self._clearance(start,candidate,threats,margin)
-                    end_clear=self._clearance(candidate,candidate,threats,margin)
-                    if end_clear>start_clear and path_clear>=start_clear-2:
-                        end=candidate
-                        self.escape_y=escape_y
-                        reason="ESCAPE"
-                        duration_ms=int(m.get("escape_ms",180))
-                    else:
-                        reason="HOLD-TRAPPED"
-        elif self.blocked:
-            self.clear_frames+=1
-            if self.clear_frames<int(m.get("clear_frames",2)):
-                reason="PARK-CONFIRM"
-            else:
-                self.blocked=False
+        with self._lock:
+            self._frame_size=(w,h)
+            self._threat_cache=threats
+            if threats:
+                self.blocked=True
                 self.clear_frames=0
-                if self.escape_y is not None:
-                    end=(start[0],row_y)
-                    self.escape_y=None
-                    reason="RETURN-LANE"
-                    duration_ms=int(m.get("escape_ms",180))
-        if not self.blocked and end==start:
-            opposite=right if start[0] <= (left+right)/2 else left
-            end=(opposite,row_y)
-            reason="SWEEP"
+            elif self.blocked:
+                self.clear_frames+=1
+                if self.clear_frames>=int(self.cfg["motion"].get("clear_frames",2)):
+                    self.blocked=False
+                    self.clear_frames=0
+            status=self._status
+            target=self.last_target
+            worker_error=self._worker_error
 
-        if not dry_run and not self.active:
-            self.touch.begin(*start,w,h)
-            self.active=True
-        if end!=start:
-            if not dry_run:
-                self.touch.move_to(*end,duration_ms,w,h)
-            self.last_target=end
-            if reason=="SWEEP":
-                self.swipes_sent+=1
-        return f"{reason} held hazards={len(hazards)} threats={len(threats)}",end
+        if worker_error is not None:
+            raise BotError(f"Continuous ADB movement failed: {worker_error}") from worker_error
+
+        if dry_run:
+            if threats:
+                return f"DRY-PARK hazards={len(threats)}", target or (w//2,int(self.control_y*h))
+            return "DRY-CONTINUOUS-SWEEP", target or (w//2,int(self.control_y*h))
+
+        self._start_worker_if_needed(w,h)
+        self._wake_worker.set()
+        with self._lock:
+            return self._status, self.last_target or (w//2,int(self.control_y*h))
 
 
 class SeaExplorerBot:

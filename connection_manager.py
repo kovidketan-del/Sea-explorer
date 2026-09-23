@@ -7,6 +7,7 @@ or a game. Pairing codes are passed to ADB once and are never logged or saved.
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import subprocess
 
@@ -17,6 +18,18 @@ class DeviceConnectionError(RuntimeError):
 
 _HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
 _SIX_DIGITS = re.compile(r"[0-9]{6}\Z")
+
+
+def _hidden_subprocess_kwargs() -> dict:
+    if os.name != "nt":
+        return {}
+    startup = subprocess.STARTUPINFO()
+    startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startup.wShowWindow = subprocess.SW_HIDE
+    return {
+        "startupinfo": startup,
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    }
 
 
 def _address(value: str) -> str:
@@ -70,6 +83,7 @@ class ConnectionManager:
                 text=True,
                 timeout=timeout,
                 check=False,
+                **_hidden_subprocess_kwargs(),
             )
         except subprocess.TimeoutExpired:
             # Do not include command arguments: a pairing code may be among them.
