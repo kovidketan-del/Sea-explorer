@@ -700,6 +700,39 @@ class Vision:
             found.append((int(cx),int(cy),int(max(bw,bh)*.5)))
         return tuple(found)
 
+    def player_x(self, frame, near_x, hsv=None):
+        """Locate the diver's magenta bag near its fixed collection row.
+
+        The touch position is a prior, not a substitute for seeing the player.
+        Restricting the search to that prior avoids mistaking reward text or a
+        passing purple virus for the diver.
+        """
+        if hsv is None:
+            hsv=self._hsv(frame)
+        h,w=hsv.shape[:2]
+        y0,y1=int(.605*h),int(.765*h)
+        crop=hsv[y0:y1]
+        if crop.size==0:
+            return None
+        H,S,V=cv2.split(crop)
+        mask=((H>=155)&(S>=90)&(V>=60)).astype(np.uint8)
+        count,_,stats,centers=cv2.connectedComponentsWithStats(mask,8)
+        minimum=max(12,int(w*h*.0002))
+        candidates=[]
+        for i in range(1,count):
+            x,y,bw,bh,area=stats[i]
+            if area>=minimum and bh>=.014*h:
+                # The diver's bag is one connected magenta body. Floating
+                # reward text is broken into much smaller letter components.
+                score=area*(1-.25*abs(centers[i,0]-near_x)/w)
+                candidates.append((score,centers[i,0],area))
+        if not candidates:
+            return None
+        best=max(candidates)
+        nearby=[entry for entry in candidates
+                if abs(entry[1]-best[1])<.15*w and entry[2]>=.15*best[2]]
+        return int(sum(entry[1]*entry[2] for entry in nearby)/sum(entry[2] for entry in nearby))
+
     def detect(self, frame, hsv=None, hazards_hint=None):
         if hsv is None:
             hsv=self._hsv(frame)
@@ -1326,7 +1359,10 @@ class SeaExplorerBot:
                     hsv=self.vision._hsv(frame)
                     quick_hazards=self.vision.hazards(frame,hsv=hsv)
                     quick_items=self.vision.collectibles(frame,hsv=hsv)
-                    pre_reason,pre_target=self.sweeper.step(frame,quick_hazards,self.dry_run,items=quick_items)
+                    prior_x=self.sweeper.last_target[0] if self.sweeper.last_target else frame.shape[1]//2
+                    player_x=self.vision.player_x(frame,prior_x,hsv=hsv)
+                    pre_reason,pre_target=self.sweeper.step(frame,quick_hazards,self.dry_run,
+                                                            items=quick_items,player_x=player_x)
                     prestepped=True
                     det=self.vision.detect(frame,hsv=hsv,hazards_hint=quick_hazards)
                 else:
@@ -1362,7 +1398,10 @@ class SeaExplorerBot:
                         reason,target=pre_reason,pre_target
                     else:
                         items=self.vision.collectibles(frame)
-                        reason,target=self.sweeper.step(frame,det.hazards,self.dry_run,items=items)
+                        prior_x=self.sweeper.last_target[0] if self.sweeper.last_target else frame.shape[1]//2
+                        player_x=self.vision.player_x(frame,prior_x)
+                        reason,target=self.sweeper.step(frame,det.hazards,self.dry_run,
+                                                        items=items,player_x=player_x)
                     if now-last_status>=1.0:
                         log(f"{reason} touch={target} hazards={len(det.hazards)} items={len(quick_items) if prestepped else len(items)}")
                         last_status=now
