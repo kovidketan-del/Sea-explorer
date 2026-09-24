@@ -74,6 +74,12 @@ class PredictivePlanningTests(unittest.TestCase):
         plan = self.planner.plan((far,near), 360, self.w, self.h, 1.0)
         self.assertEqual(plan.target_id, 1)
 
+    def test_edge_item_intercept_stays_inside_playfield_margin(self):
+        item=self.track(1,"item",20,600,radius=40)
+        plan=self.planner.plan((item,),70,self.w,self.h,1.0)
+        self.assertEqual(plan.mode,"COLLECT")
+        self.assertGreaterEqual(plan.goal,round(.12*self.w))
+
     def test_target_lock_resists_minor_score_change(self):
         a = self.track(1, "item", 300, 600)
         b = self.track(2, "item", 500, 600)

@@ -17,8 +17,10 @@ The replacement is deliberately split:
    arrival, checks reachability against horizontal speed and latency, rejects
    unsafe trajectories through virus exclusion zones, and holds a target ID
    until a materially better safe target appears. A low-value item needing
-   more than 55% of screen width is skipped. Normal targets are kept slightly
-   in from the edges; emergency avoidance may use more space when necessary.
+   more than 55% of screen width is skipped. Normal targets are kept at least
+   12% of the screen width in from either edge; the diver's body can still
+   overlap and collect objects near a boundary. Emergency avoidance may use
+   more space when necessary.
 3. `TargetController` moves one held touch in short, interruptible segments.
    Step size tapers with the remaining X error; within a 2.5%-width deadband
    it releases. A stale frame also releases. No randomness is injected.
@@ -39,8 +41,13 @@ recording found about 5,884 image pixels of observed horizontal diver travel
 at 324-pixel width over the 46–73 second interval, with 14 hypothetical
 target switches from the first predictive draft. A later replay was
 interrupted externally and is not accepted as a result. The 55%-width limit,
-edge margin and trajectory-window checks were added afterward and still need
-device validation.
+edge margin and trajectory-window checks were added afterward. Bounded split
+replays of the tuned planner then gave 0 of 98 goal samples in the outer 10%
+of the screen in the 46–58 second segment, and 1 of 118 in the 58–72 second
+segment. In that later segment, the original recorded diver trace travelled
+about 4,280 image pixels, with 13 major reversals and 10 near-full-width
+traversals. These are image-space measurements/counterfactual planner goals,
+not live before/after outcome measurements. Device validation is still needed.
 
 Run `python -m unittest discover` for deterministic regressions. The
 `test_headless_scrcpy` suite also round-trips an in-memory H.264 stream through

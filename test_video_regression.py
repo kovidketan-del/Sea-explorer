@@ -33,7 +33,7 @@ class RecordedGameplayTests(unittest.TestCase):
         self.control.last_target=(680,1072)
         self.control.step(frame, (), dry_run=True, items=items,player_x=681)
         self.assertEqual(self.control.last_plan.mode,"HOLD")
-        self.assertGreater(self.control.last_plan.goal,580)
+        self.assertGreater(self.control.last_plan.goal,540)
 
     def test_virus_blocks_crossing_to_loot(self):
         frame = self.frame("sea_48_5.jpg")
@@ -44,7 +44,7 @@ class RecordedGameplayTests(unittest.TestCase):
         self.control.step(frame, hazards, dry_run=True,
                           items=self.vision.collectibles(frame),player_x=680)
         self.assertNotEqual(self.control.last_plan.mode,"EVADE")
-        self.assertGreater(self.control.last_plan.goal,580)
+        self.assertGreater(self.control.last_plan.goal,540)
 
     def test_gameplay_hud_survives_orange_object_merging_with_oxygen_box(self):
         frame = self.frame("sea_56.jpg")

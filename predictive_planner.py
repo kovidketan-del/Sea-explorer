@@ -180,7 +180,7 @@ class InterceptPlanner:
                 continue
             # The diver has width: collecting an edge item rarely requires
             # pinning the control point against the actual display boundary.
-            intercept = clamp(x+track.vx*eta, .10*width, .90*width)
+            intercept = clamp(x+track.vx*eta, .12*width, .88*width)
             distance = abs(intercept-player_x)
             if distance > .55*width and track.radius < .11*width:
                 continue
@@ -222,10 +222,10 @@ class InterceptPlanner:
         # Only drift inward if already pressed close to a boundary. Stay in a
         # useful lane otherwise; never oscillate around the exact center.
         goal = player_x
-        if player_x < .11*width:
-            goal = .18*width
-        elif player_x > .89*width:
-            goal = .82*width
+        if player_x < .14*width:
+            goal = .20*width
+        elif player_x > .86*width:
+            goal = .80*width
         if not safe(goal):
             goal = player_x
         return Plan(round(goal), "HOLD", None, None, None,
