@@ -95,13 +95,24 @@ class InterceptPlanner:
         self.target_score = None
         self.target_switches = 0
         self.switch_reason = ""
+        self.mode = "HOLD"
+        self.selected_at = 0.0
+        self.target_last_viable_at = 0.0
+        self.target_goal = None
+        self.avoid_goal = None
+        self.recover_until = 0.0
 
     def reset(self):
         self.target_id = None
         self.target_score = None
         self.switch_reason = ""
+        self.mode = "HOLD"
+        self.selected_at = 0.0
+        self.target_goal = None
+        self.avoid_goal = None
+        self.recover_until = 0.0
 
-    def plan(self, tracks, player_x, width, height, now):
+    def plan(self, tracks, player_x, width, height, now, movement_direction=0):
         row = self.row_ratio*height
         left, right = .06*width, .94*width
         player_x = clamp(player_x, left, right)
@@ -163,9 +174,32 @@ class InterceptPlanner:
                                 for _t, eta, vx, margin in viruses), default=0)
                 goal = max(candidates, key=lambda x: clearance(x)-.03*abs(x-.5*width))
                 reason = "emergency-best-clearance"
-            self.reset()
+            self.mode="EVADE"
+            self.avoid_goal=round(goal)
+            self.recover_until=now+.18
+            self.target_id=None
+            self.target_score=None
             return Plan(round(goal), "EVADE", None, None, None, reason,
                         tuple(exclusions), threat, 0)
+
+        # Once safely outside a near virus's path, keep the clearance until
+        # it passes. Otherwise the first safe frame could send us straight
+        # back across the same exclusion zone toward loot.
+        approaching=any(-.04<=eta<=.42 for _track,eta,_x,_margin in viruses)
+        if self.mode=="EVADE" and approaching and self.avoid_goal is not None:
+            goal=self.avoid_goal if safe(self.avoid_goal) else player_x
+            return Plan(round(goal),"EVADE",None,None,None,"avoid-commitment",
+                        tuple(exclusions),threat,0)
+        if self.mode=="EVADE":
+            self.mode="RECOVER"
+            self.recover_until=now+.14
+            self.avoid_goal=None
+        if self.mode=="RECOVER" and now<self.recover_until:
+            goal=clamp(player_x,.16*width,.84*width)
+            return Plan(round(goal),"RECOVER",None,None,None,"post-virus-reassess",
+                        tuple(exclusions),threat,0)
+        if self.mode=="RECOVER":
+            self.mode="HOLD"
 
         candidates = []
         for track in tracks:
@@ -191,34 +225,65 @@ class InterceptPlanner:
             # Value is a deliberately weak size proxy; route cost and safety
             # dominate so distant items cannot provoke needless traversals.
             value = 1 + .12*clamp(track.radius/(.07*width), .4, 1.7)
-            score = value - .85*distance/width - .10*abs(intercept-.5*width)/width
+            score = value - 1.25*distance/width - .10*abs(intercept-.5*width)/width
             score += .10*clamp((.75-eta)/.75, 0, 1)
+            direction=1 if intercept>player_x else -1
+            if movement_direction and direction!=movement_direction and distance>.05*width:
+                score-=.16
+            if score<.72 and track.id!=self.target_id:
+                continue
             candidates.append((score, track, intercept, eta))
         candidates.sort(key=lambda row: row[0], reverse=True)
         reachable = len(candidates)
         chosen = candidates[0] if candidates else None
         previous = next((entry for entry in candidates if entry[1].id == self.target_id), None)
+        old_id=self.target_id
+        old_track=next((track for track in tracks if track.id==old_id),None)
+        old_invalid=(old_track is not None and
+                     (old_track.y>=row-.012*height or (row-old_track.y)/max(.4*height,old_track.vy)<.07))
+        if previous is None and old_id is not None and not old_invalid and self.target_goal is not None:
+            if now-self.target_last_viable_at<.10 and safe(self.target_goal):
+                return Plan(round(self.target_goal),"COLLECT",old_id,self.target_goal,None,
+                            "lock-grace-intermittent-detection",tuple(exclusions),threat,reachable)
         if previous is not None and chosen is not None and chosen[1].id != self.target_id:
-            # A slight score fluctuation must not reverse a crossing.
-            if chosen[0] < previous[0]+.18:
+            # Substantial score margin and a short commitment are both needed
+            # to reverse a pursuit for a newly detected collectible.
+            if now-self.selected_at<.22 or chosen[0] < previous[0]+.26:
                 chosen = previous
-            else:
-                self.switch_reason = "substantially-better-reachable-target"
         if chosen is not None:
             score, track, intercept, eta = chosen
             if self.target_id != track.id:
-                if self.target_id is not None:
+                if self.selected_at:
                     self.target_switches += 1
-                if not self.switch_reason:
-                    self.switch_reason = "new-reachable-target" if self.target_id is None else "old-target-lost-or-unsafe"
+                if previous is not None:
+                    self.switch_reason=f"new-target-{(score/max(.01,previous[0])-1)*100:.0f}pct-better"
+                elif old_invalid:
+                    self.switch_reason="current-passed-player"
+                elif old_id is not None:
+                    self.switch_reason="current-unreachable-or-lost"
+                else:
+                    self.switch_reason="new-reachable-target"
+                self.selected_at=now
             else:
                 self.switch_reason = "locked"
+            self.mode="COLLECT"
             self.target_id = track.id
             self.target_score = score
+            self.target_goal=intercept
+            self.target_last_viable_at=now
             return Plan(round(intercept), "COLLECT", track.id, intercept, eta,
                         self.switch_reason, tuple(exclusions), threat, reachable)
 
-        self.reset()
+        if old_id is not None and old_invalid:
+            hold_reason="current-passed-player"
+        elif old_id is not None:
+            hold_reason="current-unreachable-or-lost"
+        else:
+            hold_reason="no-safe-reachable-item"
+        self.mode="HOLD"
+        self.target_id=None
+        self.target_score=None
+        self.target_goal=None
         # Only drift inward if already pressed close to a boundary. Stay in a
         # useful lane otherwise; never oscillate around the exact center.
         goal = player_x
@@ -229,4 +294,4 @@ class InterceptPlanner:
         if not safe(goal):
             goal = player_x
         return Plan(round(goal), "HOLD", None, None, None,
-                    "no-safe-reachable-item", tuple(exclusions), threat, reachable)
+                    hold_reason, tuple(exclusions), threat, reachable)

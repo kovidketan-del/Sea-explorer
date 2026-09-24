@@ -52,9 +52,26 @@ class TargetController:
         self.tracked_objects_created = 0
         self.reachable_item_decisions = 0
         self.virus_tracks_created = 0
+        self.direction_events = deque(maxlen=1200)
+        self.target_events = deque(maxlen=1200)
+        self._last_player_x = None
+        self._player_observed_at = 0.0
+        self._last_player_delta = 0
+        self._last_goal_change_at = 0.0
+        self._last_target_change_at = 0.0
+        self._last_avoid_at = 0.0
+        self._previous_goal = None
+        self._filtered_goal = None
+        self._filtered_at = None
+        self._visual_at = None
+        self._visual_velocity = 0.0
+        self._mode_time = {"COLLECT":0.0,"EVADE":0.0,"RECOVER":0.0,"HOLD":0.0}
+        self._previous_mode = None
+        self._previous_mode_at = None
+        self._most_recent_target_id = None
 
     def _deadband(self, width):
-        return max(5, .025*width)
+        return max(5, .018*width)
 
     def _motion_loop(self):
         try:
@@ -71,33 +88,82 @@ class TargetController:
                         self._status = "STALE-FRAME released"
                     break
                 width, height = size
-                dx = goal-current[0]
-                if abs(dx) <= self._deadband(width):
+                with self._lock:
+                    player_x = self._last_player_x
+                    player_observed_at = self._player_observed_at
+                    previous_direction = self._previous_direction
+                if player_x is None or time.monotonic()-player_observed_at > .18:
                     with self._lock:
-                        self._status = f"{mode}-SETTLED x={current[0]} goal={goal}"
+                        self._status = "PLAYER-LOST released"
+                    break
+                dx = goal-player_x
+                deadband = .025*width if mode != "EVADE" else self._deadband(width)
+                if abs(dx) <= deadband:
+                    with self._lock:
+                        self._status = f"{mode}-SETTLED player={player_x} goal={goal}"
+                    break
+                direction = 1 if dx > 0 else -1
+                if (mode != "EVADE" and previous_direction and
+                        direction != previous_direction and abs(dx) < .10*width):
+                    with self._lock:
+                        self._status = f"{mode}-REVERSAL-SUPPRESSED player={player_x} goal={goal}"
                     break
                 # Proportional near the goal, speed-limited far away. Each
                 # segment keeps the same finger down and can be superseded by
                 # the next observed frame before a long crossing completes.
                 duration_ms = 34 if mode == "EVADE" else 40
                 max_step = .9*width*duration_ms/max(350, int(self.cfg["motion"].get("sweep_ms", 600)))
-                step = min(abs(dx)*.55, max_step)
+                # The finger is an actuator, not a position estimate. A
+                # relative touch move can send the diver farther than the
+                # finger moved, so close the loop on the observed diver.
+                step = min(abs(dx)*.35, max_step)
                 if getattr(self.touch, "low_rate", False):
-                    step = min(abs(dx)*.55, max(max_step, .09*width))
+                    step = min(abs(dx)*.35, max(max_step, .09*width))
                 step = max(1, step)
-                x = round(current[0]+math.copysign(min(abs(dx), step), dx))
+                x = round(max(.03*width,min(.97*width,
+                          current[0]+math.copysign(step, dx))))
                 if x == current[0]:
-                    x += 1 if dx > 0 else -1
+                    with self._lock:
+                        self._status = f"{mode}-TOUCH-EDGE released"
+                    break
                 self.touch.move_to(x, current[1], duration_ms, width, height)
-                direction = 1 if dx > 0 else -1
                 with self._lock:
                     if planned_at is not None:
                         self._move_latency_ms.append((time.monotonic()-planned_at)*1000)
                         self._plan_at = None
                     if self._previous_direction and self._previous_direction != direction:
                         self.direction_changes += 1
-                        if abs(x-(self._traversal_start or x)) >= .15*width:
+                        distance_before_reverse=abs(current[0]-self._traversal_start) if self._traversal_start is not None else 0
+                        major=distance_before_reverse>=.15*width
+                        if major:
                             self.major_reversals += 1
+                        plan=self.last_plan
+                        since_target=time.monotonic()-self._last_target_change_at
+                        since_avoid=time.monotonic()-self._last_avoid_at
+                        if mode=="EVADE" or since_avoid<.25:
+                            cause="virus_avoidance_or_recovery"
+                        elif since_target<.25:
+                            cause="target_switch"
+                        elif self._previous_goal is not None and abs(goal-self._previous_goal)<.05*width:
+                            cause="overshoot_or_player_lag"
+                        elif abs(self._last_player_delta)>.12*width:
+                            cause="player_localization_jump"
+                        elif since_target<.6:
+                            cause="recent_target_switch"
+                        else:
+                            cause="goal_jitter_or_other"
+                        self.direction_events.append({
+                            "at":round(time.time(),3),"major":major,
+                            "player_x":self._last_player_x,"touch_x":current[0],
+                            "touch_player_gap_px":round(current[0]-self._last_player_x,1),
+                            "previous_goal":self._previous_goal,"goal":goal,
+                            "previous_direction":self._previous_direction,
+                            "new_direction":direction,"target_id":plan.target_id if plan else None,
+                            "target_score":self.planner.target_score,
+                            "mode":mode,"threat":plan.threat if plan else 0,
+                            "cause":cause,"reason":plan.reason if plan else None,
+                            "distance_before_reverse_px":round(distance_before_reverse,1),
+                        })
                         self._traversal_start = current[0]
                     elif self._traversal_start is None:
                         self._traversal_start = current[0]
@@ -152,18 +218,67 @@ class TargetController:
         if (visually_located and not finger_active and
                 (abs(player_x-current_x)<=.25*width or visual_confirmed)):
             current_x=round(player_x)
-            self.last_target=(current_x,round(self.control_y*height))
+            with self._lock:
+                self.last_target=(current_x,round(self.control_y*height))
         with self._perception_lock:
             prior_ids=set(self.tracker.tracks)
             tracks = self.tracker.update(items, hazards, now, width, height)
             created=[track for track in tracks if track.id not in prior_ids]
             self.tracked_objects_created += len(created)
             self.virus_tracks_created += sum(track.kind=="virus" for track in created)
-            plan = self.planner.plan(tracks, player_x, width, height, now)
+            plan = self.planner.plan(tracks, player_x, width, height, now,
+                                     movement_direction=self._previous_direction)
             self.reachable_item_decisions += plan.reachable
+        previous_plan = self.last_plan
+        if plan.mode=="EVADE":
+            filtered_goal=plan.goal
+        elif (plan.mode=="COLLECT" and previous_plan is not None and
+              previous_plan.target_id==plan.target_id and
+              self._filtered_goal is not None and self._filtered_at is not None):
+            dt=max(.001,min(.15,now-self._filtered_at))
+            difference=plan.goal-self._filtered_goal
+            if abs(difference)<.018*width:
+                filtered_goal=self._filtered_goal
+            else:
+                alpha=1-math.exp(-dt/.08)
+                filtered_goal=self._filtered_goal+math.copysign(
+                    min(abs(difference)*alpha,2.1*width*dt),difference)
+        else:
+            filtered_goal=plan.goal
+        self._filtered_goal=filtered_goal
+        self._filtered_at=now
+        effective_goal=round(max(.04*width,min(.96*width,filtered_goal)))
         target = self.last_target or (current_x, round(self.control_y*height))
         with self._lock:
-            self._goal = plan.goal
+            previous_plan=self.last_plan
+            previous_goal=self._goal
+            self._last_player_delta=(player_x-self._last_player_x) if self._last_player_x is not None else 0
+            self._last_player_x=player_x
+            if visually_located:
+                self._player_observed_at=now
+            if previous_goal is not None and previous_goal!=effective_goal:
+                self._previous_goal=previous_goal
+                self._last_goal_change_at=time.monotonic()
+            if previous_plan is not None and previous_plan.target_id!=plan.target_id:
+                self._last_target_change_at=time.monotonic()
+                self.target_events.append({
+                    "at":round(time.time(),3),"old_target":previous_plan.target_id,
+                    "new_target":plan.target_id,"old_mode":previous_plan.mode,
+                    "new_mode":plan.mode,"old_goal":previous_goal,"new_goal":plan.goal,
+                    "player_x":player_x,"reason":plan.reason,
+                    "threat":plan.threat,"score":self.planner.target_score,
+                    "previous_committed_target":self._most_recent_target_id,
+                })
+            if plan.target_id is not None:
+                self._most_recent_target_id=plan.target_id
+            if plan.mode=="EVADE":
+                self._last_avoid_at=time.monotonic()
+            if self._previous_mode is not None and self._previous_mode_at is not None:
+                dt=max(0,min(.2,now-self._previous_mode_at))
+                self._mode_time[self._previous_mode]=self._mode_time.get(self._previous_mode,0)+dt
+            self._previous_mode=plan.mode
+            self._previous_mode_at=now
+            self._goal = effective_goal
             self._mode = plan.mode
             self._frame_size = (width, height)
             self._last_observation = now
@@ -176,16 +291,17 @@ class TargetController:
                 self.avoidance_decisions += 1
             elif plan.mode == "COLLECT":
                 self.collection_decisions += 1
-            error = plan.goal-player_x
+            error = effective_goal-player_x
             direction = "R" if error > self._deadband(width) else "L" if error < -self._deadband(width) else "-"
             self._status = (f"{plan.mode} target={plan.target_id or '-'} intercept={plan.intercept_x} "
                             f"eta={plan.eta if plan.eta is not None else '-'} "
-                            f"player={player_x} goal={plan.goal} error={error:+.0f} dir={direction} "
+                            f"player={player_x} raw={plan.goal} filtered={filtered_goal:.0f} "
+                            f"goal={effective_goal} error={error:+.0f} dir={direction} "
                             f"threat={plan.threat:.2f} exclusion={plan.exclusion} reason={plan.reason}")
             status = self._status
         if dry_run:
             return "DRY-"+status, target
-        if (abs(plan.goal-current_x) > self._deadband(width) and
+        if (visually_located and abs(effective_goal-player_x) > .04*width and
                 (self._worker is None or not self._worker.is_alive())):
             self._stop.clear()
             start = (current_x, round(self.control_y*height))
@@ -228,6 +344,16 @@ class TargetController:
     def snapshot_metrics(self):
         with self._lock:
             latency = self._move_latency_ms
+            major_by_cause={}
+            for event in self.direction_events:
+                if event["major"]:
+                    major_by_cause[event["cause"]]=major_by_cause.get(event["cause"],0)+1
+            switch_reasons={}
+            for event in self.target_events:
+                if (event["new_target"] is not None and
+                        event["new_target"]!=event["previous_committed_target"] and
+                        event["previous_committed_target"] is not None):
+                    switch_reasons[event["reason"]]=switch_reasons.get(event["reason"],0)+1
             return {
                 "tracked_objects_created": self.tracked_objects_created,
                 "virus_tracks_created": self.virus_tracks_created,
@@ -240,6 +366,11 @@ class TargetController:
                 "edge_observation_ratio": round(self.edge_observations/max(1,self.observations),3),
                 "decision_to_move_ms_mean": round(sum(latency)/len(latency),1) if latency else None,
                 "last_plan": None if self.last_plan is None else self.last_plan.__dict__,
+                "mode_time_s":{key:round(value,2) for key,value in self._mode_time.items()},
+                "major_reversal_causes":major_by_cause,
+                "target_switch_reasons":switch_reasons,
+                "direction_events":list(self.direction_events),
+                "target_events":list(self.target_events),
             }
 
     def stop(self):
@@ -267,6 +398,15 @@ class TargetController:
             self._worker = None
             self._visual_candidate = None
             self._visual_candidate_count = 0
+            self._filtered_goal = None
+            self._filtered_at = None
+            self._visual_at = None
+            self._visual_velocity = 0.0
+            self._player_observed_at = 0.0
+            self._last_player_x = None
+            self._most_recent_target_id = None
+            self._previous_mode = None
+            self._previous_mode_at = None
         with self._perception_lock:
             self.tracker = ObjectTracker()
             self.planner.reset()
