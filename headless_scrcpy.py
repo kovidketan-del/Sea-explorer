@@ -1,8 +1,8 @@
 """Version-pinned scrcpy 4.1 video/control sockets without any desktop window.
 
 The Android server emits H.264 access units over an ADB-forwarded TCP socket.
-PyAV decodes those units directly into BGR arrays for OpenCV.  Only the newest
-decoded frame is retained, so a slow vision pass cannot accumulate stale work.
+An isolated FFmpeg executable decodes those units into BGR arrays for OpenCV.
+Only the newest decoded frame is retained, so vision cannot queue stale work.
 The protocol is internal to scrcpy: this module intentionally requires the
 matching bundled 4.1 server and rejects any other reported codec.
 """
@@ -15,7 +15,6 @@ import re
 import socket
 import struct
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -28,8 +27,21 @@ from scrcpy_binary import find_scrcpy
 
 SERVER_VERSION = "4.1"
 REMOTE_SERVER = "/data/local/tmp/sea-explorer-scrcpy-v4.1.jar"
-PACKET_CONFIG = 1 << 62
 MAX_PACKET = 8 * 1024 * 1024
+
+
+def _decoder_command(codec):
+    from imageio_ffmpeg import get_ffmpeg_exe
+    input_codec="hevc" if codec=="h265" else "h264"
+    return [
+        get_ffmpeg_exe(),"-hide_banner","-loglevel","error",
+        "-flags","low_delay",
+        "-probesize","32768","-analyzeduration","0",
+        "-f",input_codec,"-i","pipe:0",
+        "-map","0:v:0","-an","-sn","-dn","-threads","1",
+        "-fps_mode","passthrough","-pix_fmt","bgr24",
+        "-f","rawvideo","pipe:1",
+    ]
 
 
 class StreamUnavailable(RuntimeError):
@@ -151,9 +163,8 @@ class HeadlessScrcpy:
             self.video_size=struct.unpack(">II",session[4:12])
             self.video_socket.settimeout(None)
             self._decoder_log=tempfile.TemporaryFile(mode="w+b")
-            worker=Path(__file__).resolve().parent / "scripts" / "scrcpy_decoder_worker.py"
             self.decoder_process=subprocess.Popen(
-                [sys.executable,"-X","faulthandler","-u",str(worker),"--codec",self.codec],
+                _decoder_command(self.codec),
                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=self._decoder_log,
                 **_hidden_process_options(),
             )
@@ -194,7 +205,6 @@ class HeadlessScrcpy:
                 pipe=self.decoder_process.stdin
                 if pipe is None:
                     raise StreamUnavailable("decoder stdin unavailable")
-                pipe.write(header)
                 pipe.write(payload)
                 pipe.flush()
                 self.metrics["packets"]+=1
@@ -209,21 +219,16 @@ class HeadlessScrcpy:
             output=self.decoder_process.stdout
             if output is None:
                 raise StreamUnavailable("decoder stdout unavailable")
+            w,h=self.video_size
+            frame_bytes=w*h*3
             while not self._closed:
-                header=_read_exact(output,24)
-                w,h,pts,decode_ms,convert_ms=struct.unpack(">IIQff",header)
-                if (w,h)!=self.video_size:
-                    raise StreamUnavailable(f"decoder frame size changed to {w}x{h}")
-                raw=_read_exact(output,w*h*3)
+                raw=_read_exact(output,frame_bytes)
                 array=np.frombuffer(raw,dtype=np.uint8).reshape((h,w,3))
                 arrived=time.perf_counter()
                 with self._condition:
-                    self._latest=(array,arrived,arrived,pts)
+                    self._latest=(array,arrived,arrived,None)
                     self._sequence+=1
                     self.metrics["frames"]+=1
-                    self.metrics["decode_ms"].append(decode_ms)
-                    self.metrics["convert_ms"].append(convert_ms)
-                    self.metrics["packet_pts_us"]=pts
                     self.metrics["packet_received_at"]=arrived
                     self._condition.notify_all()
         except Exception as exc:
@@ -260,6 +265,11 @@ class HeadlessScrcpy:
                 raise StreamUnavailable("No decoded scrcpy frame arrived")
             self._last_delivered=self._sequence
             return self._latest[0]
+
+    def peek_frame(self):
+        """Copy the current image for optional diagnostics without consuming it."""
+        with self._condition:
+            return None if self._latest is None else self._latest[0].copy()
 
     @property
     def last_frame_age(self):

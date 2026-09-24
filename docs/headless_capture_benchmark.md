@@ -70,23 +70,22 @@ not values to fill with estimates.
 
 **Crash-safety update:** a gameplay run and a launcher-only held-touch test
 exposed a native PyAV/FFmpeg access violation inside `decoder.decode()`.
-The original in-process benchmark above predates the fix. Decoding now runs in
-a child process, passing BGR frames over a pipe; if native decoding faults,
-the bot sees EOF, releases held touch, and stops rather than crashing its own
-process. In a repeat launcher/Pointer Location benchmark of the isolated H.264
-path, 55.1 changing frames/s were delivered; new-frame wait median/p95 was
-15.6/52.2 ms; decoder and BGR conversion medians were 1.1/3.2 ms. The parent
-and decoder together consumed about 40% of one CPU core during pointer
-animation. These short samples do **not** establish that the final path has
-lower end-to-end latency than the visible-window baseline: the new p95 wait is
-higher than the earlier in-process sample, and a touch-to-overlay response
-varied from 80 to 245 ms. Stability and the lack of a visible window are the
-verified benefits of the isolation so far.
+Putting PyAV in a child process protected the parent and released held touch,
+but a later gameplay run still lost its decoder after 55 seconds. Its earlier
+short benchmark delivered 55.1 frames/s, with a new-frame wait median/p95 of
+15.6/52.2 ms and roughly 40% of one CPU core across parent and child during
+pointer animation; these are **historical PyAV figures, not final results**.
+The implementation is switching to an isolated FFmpeg executable decoding
+raw H.264 into BGR frames over pipes. Its performance and stability remain to
+be measured. No lower end-to-end latency is claimed on the basis of the old
+PyAV samples.
 
 For repeatable checks, run the benchmark scripts while the same phone and USB
 connection are available. The bounded no-purchase live check is
 `scripts/bounded_live_headless.py --seconds 75 --out <receipt.json>`; it releases
-the held touch, closes sockets, and returns the phone to Home at the end.
+the held touch, closes sockets, and returns the phone to Home at the end. Add
+`--snapshots-dir <directory>` to save optional low-rate frames during a test;
+normal bot operation does not write screenshots.
 
 ## Live-test status
 
@@ -95,6 +94,12 @@ cleanly, but recorded zero collection/avoidance decisions. Its frame showed
 the Android **keyguard** rather than Sea Explorer; therefore it is **not**
 accepted as a gameplay validation. The bot and bounded test now refuse to run
 when `dumpsys window policy` says the keyguard is showing. A repeat after the
-phone is unlocked is still required to assess live control, reaction latency,
-collection, hazard avoidance, and long-run stability. No claim about those
-gameplay outcomes is made from the locked-phone attempt.
+phone was unlocked exposed a native PyAV decoder fault, contained by the
+decoder child process but not cured. A later 120-second run exposed a separate recognition
+error: the downscaled HOME title was mistaken for the gameplay HUD, causing
+central hovering instead of a dive. The exact HOME frame is now a regression
+fixture, and downscaled gameplay frames remain recognized as PLAYING. These
+failed or partial attempts do not establish collection, virus avoidance, or
+long-run gameplay stability. A 55-second run with PyAV did complete two dives
+and release touch when decoding failed, but it did not meet the 150-second
+stability target. A further live result with the replacement decoder is required.

@@ -2,12 +2,13 @@
 
 import struct
 import io
+import subprocess
 import time
 import unittest
 
 import numpy as np
 
-from headless_scrcpy import HeadlessScrcpy, ScrcpySocketTouch, StreamUnavailable
+from headless_scrcpy import HeadlessScrcpy, ScrcpySocketTouch, StreamUnavailable, _decoder_command
 from sea_explorer_bot import ADB
 
 
@@ -22,6 +23,19 @@ class RecordingSocket:
 class Runtime:
     def __init__(self):
         self.control_socket=RecordingSocket()
+
+
+class InputSocket:
+    def __init__(self, data):
+        self.data=memoryview(data)
+        self.offset=0
+
+    def recv_into(self, view):
+        count=min(len(view),len(self.data)-self.offset)
+        if count:
+            view[:count]=self.data[self.offset:self.offset+count]
+            self.offset+=count
+        return count
 
 
 class SocketTouchTests(unittest.TestCase):
@@ -50,6 +64,24 @@ class SocketTouchTests(unittest.TestCase):
 
 
 class LatestFrameTests(unittest.TestCase):
+    def test_ffmpeg_pipe_decodes_h264_without_window(self):
+        from imageio_ffmpeg import get_ffmpeg_exe
+        width,height=64,64
+        raw=b"".join(np.full((height,width,3),i*20,np.uint8).tobytes()
+                     for i in range(8))
+        encoded=subprocess.run([
+            get_ffmpeg_exe(),"-loglevel","error","-f","rawvideo",
+            "-pix_fmt","bgr24","-s",f"{width}x{height}","-r","30",
+            "-i","pipe:0","-frames:v","8","-c:v","libx264",
+            "-preset","ultrafast","-tune","zerolatency","-f","h264","pipe:1",
+        ],input=raw,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+            check=True,timeout=10).stdout
+        decoded=subprocess.run(_decoder_command("h264"),input=encoded,
+                               stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                               check=True,timeout=10)
+        self.assertGreaterEqual(len(decoded.stdout),width*height*3,
+                                decoded.stderr.decode(errors="replace"))
+
     def test_returns_latest_without_building_frame_queue(self):
         runtime=HeadlessScrcpy.__new__(HeadlessScrcpy)
         import threading
@@ -62,6 +94,9 @@ class LatestFrameTests(unittest.TestCase):
         self.assertIs(runtime.capture(timeout=0),frame)
         self.assertEqual(runtime._last_delivered,5)
         self.assertLess(runtime.last_frame_age,.1)
+        preview=runtime.peek_frame()
+        self.assertIsNot(preview,frame)
+        self.assertEqual(runtime._last_delivered,5)
 
     def test_stream_error_fails_closed(self):
         runtime=HeadlessScrcpy.__new__(HeadlessScrcpy)
@@ -83,6 +118,7 @@ class LatestFrameTests(unittest.TestCase):
         runtime._last_delivered=0
         runtime._error=None
         runtime._closed=False
+        runtime.video_size=(324,720)
         runtime._decoder_log=io.BytesIO(b"Windows fatal exception: access violation")
         runtime.decoder_process=type("Crashed",(),{
             "stdout":io.BytesIO(b""),
@@ -91,6 +127,24 @@ class LatestFrameTests(unittest.TestCase):
         runtime._frame_loop()
         with self.assertRaisesRegex(StreamUnavailable,"access violation"):
             runtime.capture(timeout=0)
+
+    def test_packet_headers_are_removed_before_ffmpeg_stdin(self):
+        import threading
+        config=b"\0\0\0\x01\x67\x42"
+        frame=b"\0\0\0\x01\x65\x99"
+        encoded=(struct.pack(">QI",1<<62,len(config))+config
+                 +struct.pack(">QI",12345,len(frame))+frame)
+        runtime=HeadlessScrcpy.__new__(HeadlessScrcpy)
+        runtime.video_socket=InputSocket(encoded)
+        sink=io.BytesIO()
+        runtime.decoder_process=type("Decoder",(),{"stdin":sink})()
+        runtime.metrics={"packets":0}
+        runtime._closed=False
+        runtime._condition=threading.Condition()
+        runtime._error=None
+        runtime._packet_loop()
+        self.assertEqual(sink.getvalue(),config+frame)
+        self.assertEqual(runtime.metrics["packets"],2)
 
 
 class PhoneLockTests(unittest.TestCase):

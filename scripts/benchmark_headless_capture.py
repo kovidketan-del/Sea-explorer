@@ -40,7 +40,7 @@ def main():
                           codec=args.codec,max_fps=args.max_fps)
     touch=ScrcpySocketTouch(runtime)
     own=psutil.Process()
-    result={"backend":f"scrcpy 4.1 {args.codec} packets -> PyAV BGR, no window"}
+    result={"backend":f"scrcpy 4.1 {args.codec} packets -> isolated FFmpeg BGR, no window"}
     try:
         runtime.start()
         w,h=runtime.video_size
@@ -80,6 +80,7 @@ def main():
         result["cpu_pct_one_core"]=cpu|{"total":round(sum(cpu.values()),1)}
         result["decode"] = summary([x/1000 for x in runtime.metrics["decode_ms"]])
         result["bgr_conversion"] = summary([x/1000 for x in runtime.metrics["convert_ms"]])
+        result["decode_stage_note"]="FFmpeg executable does not expose per-frame decode/conversion timestamps"
         result["packets"] = runtime.metrics["packets"]
         result["frames"] = runtime.metrics["frames"]
 
