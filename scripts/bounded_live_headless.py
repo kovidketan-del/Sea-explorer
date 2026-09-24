@@ -24,11 +24,15 @@ def main():
     parser.add_argument("--out",type=Path,required=True)
     parser.add_argument("--snapshots-dir",type=Path,
                         help="optional low-rate gameplay snapshots for visual review")
+    parser.add_argument("--snapshot-interval",type=float,default=3,
+                        help="seconds between optional snapshots (0.2..5)")
     parser.add_argument("--debug-overlay",action="store_true",
                         help="annotate optional snapshots with tracks, paths and exclusion zones")
     args=parser.parse_args()
     if not 5<=args.seconds<=180:
         parser.error("seconds must be 5..180")
+    if not .2<=args.snapshot_interval<=5:
+        parser.error("snapshot interval must be 0.2..5 seconds")
     cfg=load_config()
     cfg["economy"]["buy_upgrades"]=False
     cfg["capture_backend"]="scrcpy_stream"
@@ -51,16 +55,19 @@ def main():
         if args.snapshots_dir is None:
             return
         args.snapshots_dir.mkdir(parents=True,exist_ok=True)
-        while not snapshot_stop.wait(3):
+        while not snapshot_stop.wait(args.snapshot_interval):
             runtime=bot.capture_runtime
             if runtime is None or runtime.last_frame_age>.5:
                 continue
             frame=runtime.peek_frame()
             if frame is None:
                 continue
+            stamp=int((time.monotonic()-start)*1000)
             if args.debug_overlay:
+                raw=args.snapshots_dir/f"raw_{stamp:07d}.jpg"
+                cv2.imwrite(str(raw),frame,[cv2.IMWRITE_JPEG_QUALITY,85])
                 frame=bot.sweeper.render_debug(frame)
-            path=args.snapshots_dir/f"frame_{int(time.monotonic()-start):04d}.jpg"
+            path=args.snapshots_dir/f"frame_{stamp:07d}.jpg"
             if cv2.imwrite(str(path),frame,[cv2.IMWRITE_JPEG_QUALITY,85]):
                 snapshots.append(str(path))
 

@@ -676,7 +676,7 @@ class Vision:
                 found.append((cx,cy,radius))
         return tuple(found)
 
-    def collectibles(self, frame, hsv=None):
+    def collectibles(self, frame, hsv=None, player_x=None):
         """Find warm gold loot above the diver, excluding HUD and held bag art.
 
         The background is cyan, while coins, vases and treasure in the supplied
@@ -696,6 +696,12 @@ class Vision:
             if not (.025<=bw/w<=.40 and .018<=bh/h<=.20):
                 continue
             if area/max(1,bw*bh)<.18:
+                continue
+            # The diver's own gold bag extends into the loot detection band.
+            # Without this spatial exclusion it becomes a persistent false
+            # target that pins the controller near an edge for whole dives.
+            if (player_x is not None and cy>.57*h and
+                    abs(cx-player_x)<.18*w):
                 continue
             found.append((int(cx),int(cy),int(max(bw,bh)*.5)))
         return tuple(found)
@@ -1015,6 +1021,23 @@ class Sweeper:
             return self._status, self.last_target or (w//2,int(self.control_y*h))
 
 
+class RunCompletionGate:
+    """Count a dive once across transition/result/popup recognition glitches."""
+
+    def __init__(self):
+        self.counted=False
+
+    def transition(self,previous,current):
+        if current=="PLAYING" and previous in {None,"HOME"}:
+            self.counted=False
+        if (previous=="PLAYING" and
+                current in {"RESULT","TRANSITION","WIN_MACHINE","HOME"} and
+                not self.counted):
+            self.counted=True
+            return True
+        return False
+
+
 class SeaExplorerBot:
     def __init__(self, cfg, dry_run=False, *, serial=None, window_title=None,
                  stop_event=None, transport=None):
@@ -1043,6 +1066,7 @@ class SeaExplorerBot:
         self.capture_runtime=None
         self.stream_stats=None
         self.prev_state=None
+        self.run_completion_gate=RunCompletionGate()
         self.playing_unknown_since=None
         self.home_handled=False
         self.last_start_attempt=0.0
@@ -1358,9 +1382,9 @@ class SeaExplorerBot:
                 if self.prev_state=="PLAYING":
                     hsv=self.vision._hsv(frame)
                     quick_hazards=self.vision.hazards(frame,hsv=hsv)
-                    quick_items=self.vision.collectibles(frame,hsv=hsv)
                     prior_x=self.sweeper.last_target[0] if self.sweeper.last_target else frame.shape[1]//2
                     player_x=self.vision.player_x(frame,prior_x,hsv=hsv)
+                    quick_items=self.vision.collectibles(frame,hsv=hsv,player_x=player_x)
                     pre_reason,pre_target=self.sweeper.step(frame,quick_hazards,self.dry_run,
                                                             items=quick_items,player_x=player_x)
                     prestepped=True
@@ -1385,7 +1409,7 @@ class SeaExplorerBot:
 
                 if det.state != self.prev_state:
                     log(f"STATE {self.prev_state or '-'} -> {det.state} conf={det.confidence:.2f}")
-                    if self.prev_state=="PLAYING" and det.state in {"RESULT","TRANSITION","WIN_MACHINE","HOME"}:
+                    if self.run_completion_gate.transition(self.prev_state,det.state):
                         self.progress.runs_completed += 1
                         self.progress.save()
                         log(f"Completed run #{self.progress.runs_completed}")
@@ -1397,9 +1421,9 @@ class SeaExplorerBot:
                     if prestepped:
                         reason,target=pre_reason,pre_target
                     else:
-                        items=self.vision.collectibles(frame)
                         prior_x=self.sweeper.last_target[0] if self.sweeper.last_target else frame.shape[1]//2
                         player_x=self.vision.player_x(frame,prior_x)
+                        items=self.vision.collectibles(frame,player_x=player_x)
                         reason,target=self.sweeper.step(frame,det.hazards,self.dry_run,
                                                         items=items,player_x=player_x)
                     if now-last_status>=1.0:

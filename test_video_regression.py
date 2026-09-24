@@ -28,6 +28,9 @@ class RecordedGameplayTests(unittest.TestCase):
         frame = self.frame("sea_48.jpg")
         items = self.vision.collectibles(frame)
         self.assertTrue(any(abs(x - 48) < 25 and abs(y - 731) < 30 for x, y, _ in items))
+        filtered=self.vision.collectibles(frame,player_x=680)
+        self.assertEqual(len(filtered),1)
+        self.assertAlmostEqual(filtered[0][0],48,delta=25)
         # Already too late to cross the entire screen before it reaches the
         # diver. The old planner chased it all the way to the edge anyway.
         self.control.last_target=(680,1072)

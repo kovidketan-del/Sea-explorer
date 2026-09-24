@@ -3,7 +3,17 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from sea_explorer_bot import ADB, ADBTouch, BotError, SeaExplorerBot, StopRequested
+from sea_explorer_bot import ADB, ADBTouch, BotError, SeaExplorerBot, StopRequested, RunCompletionGate
+
+
+class RunCompletionTests(unittest.TestCase):
+    def test_result_animation_does_not_double_count_one_dive(self):
+        gate=RunCompletionGate()
+        states=(None,"PLAYING","TRANSITION","RESULT","PLAYING","WIN_MACHINE","HOME",
+                "PLAYING","RESULT")
+        counts=[gate.transition(a,b) for a,b in zip(states,states[1:])]
+        self.assertEqual(sum(counts),2)
+        self.assertFalse(counts[4])
 
 
 class DeviceBindingTests(unittest.TestCase):
